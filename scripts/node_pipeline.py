@@ -253,6 +253,19 @@ def _compute_dense_gather_batched(
         cube[:, pair_receiver_t[cross_pair_t], pair_source_t[cross_pair_t], :] = corr[
             :, cross_pair_t, :
         ].flip(-1)
+        fk_params = params.get("fk_filt", {})
+        if bool(fk_params.get("enabled", params.get("fk_enabled", False))):
+            with torch.inference_mode():
+                cube = torch_cc_backend.fk_filter(
+                    cube,
+                    sps=1.0 / float(meta["dt"]),
+                    dx=float(meta.get("dx", 1.0)),
+                    sgn=str(fk_params.get("sgn", params.get("fk_sgn", "both"))),
+                    cmin=float(fk_params.get("cmin", params.get("fk_cmin", 10.0))),
+                    cmax=float(fk_params.get("cmax", params.get("fk_cmax", 2000.0))),
+                    device=str(corr.device),
+                    dtype="float64" if cube.dtype == torch.float64 else "float32",
+                )
         cube_batches.append(cube)
         del spectra_batch
     if not cube_batches:
@@ -355,6 +368,20 @@ def run_node_ccf(config: NodeCCFConfig) -> Path:
     cc_params.update(
         {"cc_len": config.cc_len, "maxlag": config.maxlag, "cc_dtype": config.dtype}
     )
+    fk_params = dict(cc_params.get("fk_filt", {}))
+    fk_params.setdefault("enabled", bool(cc_params.get("fk_enabled", False)))
+    fk_params.setdefault("cmin", float(cc_params.get("fk_cmin", 10.0)))
+    fk_params.setdefault("cmax", float(cc_params.get("fk_cmax", 2000.0)))
+    fk_params.setdefault("sgn", str(cc_params.get("fk_sgn", "both")))
+    cc_params["fk_filt"] = fk_params
+    if fk_params["enabled"]:
+        LOG.info(
+            "FK velocity filter enabled: cmin=%.3f m/s, cmax=%.3f m/s, sign=%s, dx=%.6f m",
+            float(fk_params["cmin"]),
+            float(fk_params["cmax"]),
+            fk_params["sgn"],
+            float(meta["dx"]),
+        )
     runtime = cc_backend.diagnose_runtime(
         str(cc_params.get("cc_backend", "auto")),
         str(cc_params.get("cc_device", "auto")),
