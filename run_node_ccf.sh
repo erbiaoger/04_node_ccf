@@ -8,12 +8,28 @@ CSV="${1:-}" # 排序 CSV；若配置含 station_csv 可省略
 DATA_DIR="${2:-}" # 可由配置中的 node_data_dir 提供；空值时使用 CLI 默认节点目录
 OUT_DIR="${3:-}" # 可由配置中的 node_output_dir 提供；空值时使用 CLI 默认输出目录
 CONFIG="${CONFIG:-${SCRIPT_DIR}/config/cc_config.jsonc}" # 节点配置；内部继承 DAS cc_config.jsonc
-# 独立仓库运行时，当前目录是 DASQT_REPO_DIR；因此将本仓库的默认输入/输出
-# 绝对路径显式传给 CLI，避免把相对路径误解析到外部 DAS 仓库。
-[[ -z "${CSV}" ]] && CSV="${SCRIPT_DIR}/config/line_380_stations.csv"
-[[ -z "${OUT_DIR}" ]] && OUT_DIR="${SCRIPT_DIR}/outputs/node_ccf"
-ARGS=(--config "${CONFIG}" --csv "${CSV}" --output-dir "${OUT_DIR}")
+
+# 外部 DAS 仓库运行时会切换工作目录；先把显式相对参数固定为启动脚本所在
+# 工作目录下的绝对路径，避免 CSV、数据目录和自定义 CONFIG 被错误解析。
+_node_abs_path() {
+  case "$1" in
+    /*) printf '%s\n' "$1" ;;
+    *) printf '%s/%s\n' "$PWD" "$1" ;;
+  esac
+}
+
+CONFIG="$(_node_abs_path "${CONFIG}")"
+[[ -n "${CSV}" ]] && CSV="$(_node_abs_path "${CSV}")"
+[[ -n "${DATA_DIR}" ]] && DATA_DIR="$(_node_abs_path "${DATA_DIR}")"
+[[ -n "${OUT_DIR}" ]] && OUT_DIR="$(_node_abs_path "${OUT_DIR}")"
+
+# 只把显式传入的位置参数作为覆盖项传给 CLI；留空时由 cc_config.jsonc 提供默认值。
+# 这样 station_csv/node_output_dir 中的相对路径会按 04_node_ccf 仓库解析，
+# 不会因为运行环境切换到外部 DASQT_REPO_DIR 而失效。
+ARGS=(--config "${CONFIG}")
+[[ -n "${CSV}" ]] && ARGS+=(--csv "${CSV}")
 [[ -n "${DATA_DIR}" ]] && ARGS+=(--data-dir "${DATA_DIR}")
+[[ -n "${OUT_DIR}" ]] && ARGS+=(--output-dir "${OUT_DIR}")
 [[ -n "${READ_MODE:-}" ]] && ARGS+=(--read-mode "${READ_MODE}") # preload 或 window
 [[ "${INCLUDE_AUTOCORR:-0}" == "1" ]] && ARGS+=(--include-autocorr) # 是否计算自相关
 [[ -n "${PAIR_MODE:-}" ]] && ARGS+=(--pair-mode "${PAIR_MODE}") # all_pairs 或 sliding

@@ -50,7 +50,15 @@ START_UTC=2026-07-09T11:00:00Z END_UTC=2026-07-09T12:00:00Z \
 bash examples/04_node_ccf/run_node_ccf.sh
 ```
 
-脚本默认读取本目录的 `config/cc_config.jsonc`，并自动继承 `examples/03_ccf/config/cc_config.jsonc` 的 DAS 参数。频带、短窗、归一化、后端、数据类型和 `time_downsample` 等设置都会传给节点流程。需要换配置时设置 `CONFIG=/path/to/cc_config.jsonc`；只有设置 `PAIR_MODE`、`CC_LEN` 等环境变量时才覆盖配置值。
+脚本默认读取本目录的 `config/cc_config.jsonc`，并自动继承 `examples/03_ccf/config/cc_config.jsonc` 的 DAS 参数。频带、短窗、归一化、后端、数据类型和 `time_downsample` 等设置都会传给节点流程。配置中的相对路径以 `04_node_ccf` 仓库根目录为基准，因此下面的配置可直接使用：
+
+```jsonc
+"station_csv": "./config/line_380_stations.csv",
+"node_data_dir": "/mnt/nas-changbai/2026SaErTuoHai_passive",
+"node_output_dir": "./outputs/node_ccf"
+```
+
+绝对路径按原样使用；一键脚本中显式传入的 CSV、数据目录和输出目录会覆盖配置值。需要换配置时设置 `CONFIG=/path/to/cc_config.jsonc`；只有设置 `PAIR_MODE`、`CC_LEN` 等环境变量时才覆盖对应配置值。脚本会在切换到外部 DAS 仓库前把这些显式参数转换为绝对路径。
 
 也可以只传 CSV，让脚本自动使用默认 DAS 配置和节点目录；或显式指定配置：
 

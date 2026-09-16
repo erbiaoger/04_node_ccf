@@ -42,6 +42,15 @@ from dasqt.features.dispersion.backend.components.ccf.folder_pipeline import (
 )
 
 
+def _config_relative_path(value: object, config_path: Path) -> Path:
+    """Resolve a node path relative to the standalone 04_node_ccf repository."""
+    path = Path(str(value)).expanduser()
+    if path.is_absolute():
+        return path
+    node_repo_dir = config_path.expanduser().resolve().parent.parent
+    return (node_repo_dir / path).resolve()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="按 CSV 顺序读取 SAC 节点并计算 DAS 兼容互相关"
@@ -103,17 +112,21 @@ def main() -> None:
         params["cc_device"] = args.cc_device
     if args.cc_batch_chunks is not None:
         params["cc_batch_chunks"] = args.cc_batch_chunks
+    csv_path = args.csv or _config_relative_path(
+        params.get("station_csv", "stations.csv"), config_path
+    )
+    data_dir = args.data_dir or _config_relative_path(
+        params.get("node_data_dir", "/Volumes/CSIM/2026SaErTuoHai_passive"),
+        config_path,
+    )
+    output_dir = args.output_dir or _config_relative_path(
+        params.get("node_output_dir", "outputs/node_ccf"), config_path
+    )
     run_node_ccf(
         NodeCCFConfig(
-            csv_path=args.csv or Path(params.get("station_csv", "stations.csv")),
-            data_dir=args.data_dir
-            or Path(
-                params.get("node_data_dir", "/Volumes/CSIM/2026SaErTuoHai_passive")
-            ),
-            output_dir=args.output_dir
-            or Path(
-                params.get("node_output_dir", "examples/04_node_ccf/outputs/node_ccf")
-            ),
+            csv_path=csv_path,
+            data_dir=data_dir,
+            output_dir=output_dir,
             read_mode=args.read_mode or params.get("read_mode", "preload"),
             include_autocorr=bool(
                 args.include_autocorr or params.get("include_autocorr", False)

@@ -3,9 +3,9 @@
 {
     // ---------- 节点输入与输出 ----------
     // 排序 CSV；也可以在一键脚本第一个参数中传入。
-    "station_csv": "examples/04_node_ccf/config/line_380_stations.csv",
-    "node_data_dir": "/Volumes/CSIM/2026SaErTuoHai_passive",
-    "node_output_dir": "examples/04_node_ccf/outputs/node_ccf",
+    "station_csv": "./config/line_380_stations.csv",
+    "node_data_dir": "/mnt/nas-changbai/2026SaErTuoHai_passive",
+    "node_output_dir": "./outputs/node_ccf",
     // preload：完整共同时间段一次性载入内存；window：逐个短窗读取。
     "read_mode": "preload",
     "pair_mode": "all_pairs",
