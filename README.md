@@ -59,6 +59,6 @@ CONFIG=examples/04_node_ccf/config/cc_config.jsonc \
 bash examples/04_node_ccf/run_node_ccf.sh /path/to/stations.csv
 ```
 
-当前第380线使用 `pair_mode=all_pairs`，每个节点与自己也计算自相关，因此实际只计算 `34 × 35 / 2 = 595` 个无序台站对。B–A 不重复计算，而由 A–B 沿延迟轴反转得到。计算先将 `minute_stack_s=60` 秒内的短窗叠加为一个一分钟段，再将 `save_every=30` 个一分钟段叠加，输出一个与 DAS CCF 兼容的 MAT 文件：`data` 形状为 `(源节点, 延迟采样点, 接收节点)`。末尾不足一个时间段的短窗也会单独保存。
+当前第380线默认只计算不同台站的无序对：34 个台站对应 `34 × 33 / 2 = 561` 个互相关。B–A 不重复计算，而由 A–B 沿延迟轴反转得到；输出矩阵对角线默认置零。如需自相关，设置 `INCLUDE_AUTOCORR=1`，此时增加 34 个对角线结果。计算先将 `minute_stack_s=60` 秒内的短窗叠加为一个一分钟段，再将 `save_every=30` 个一分钟段叠加，输出一个与 DAS CCF 兼容的 MAT 文件：`data` 形状为 `(源节点, 延迟采样点, 接收节点)`。末尾不足一个时间段的短窗也会单独保存。
 
 输出文件按 `cc_stack_0001_n30.mat`、`cc_stack_0002_n30.mat` 等命名；文件名中的 `n` 是该文件包含的一分钟段数量，最后不足 30 段时也会单独保存。每个 MAT 文件包含 `data`、`dt`、`dx`、`profileX`、台站号和台站对索引等字段，可直接交给现有 DAS 的 MAT 后处理读取。`actual_short_window_count` 记录该文件实际叠加了多少个短窗，便于检查边界时间段。

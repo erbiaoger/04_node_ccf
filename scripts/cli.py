@@ -61,6 +61,11 @@ def main() -> None:
         choices=("preload", "window"),
         help="数据读取模式：preload 一次性读入内存，window 逐窗读取",
     )
+    parser.add_argument(
+        "--include-autocorr",
+        action="store_true",
+        help="额外计算台站自相关；默认只计算不同台站的无序对",
+    )
     parser.add_argument("--pair-mode", choices=("all_pairs", "sliding"))
     parser.add_argument("--offset-m", type=float, help="滑动模式接收范围（米）")
     parser.add_argument("--dshot-m", type=float, help="滑动模式震源步长（米）")
@@ -110,6 +115,9 @@ def main() -> None:
                 params.get("node_output_dir", "examples/04_node_ccf/outputs/node_ccf")
             ),
             read_mode=args.read_mode or params.get("read_mode", "preload"),
+            include_autocorr=bool(
+                args.include_autocorr or params.get("include_autocorr", False)
+            ),
             pair_mode=args.pair_mode or params.get("pair_mode", "all_pairs"),
             cc_len=args.cc_len or float(params.get("cc_len", 5.0)),
             step_s=args.step_s

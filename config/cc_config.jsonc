@@ -31,8 +31,8 @@
     "cc_dtype": "float32",
 
     // ---------- 数值后端 ----------
-    // auto + cuda：服务器优先使用 CUDA；没有 CUDA 时按 DAS 逻辑回退 CPU。
-    "cc_backend": "auto",
+    // 服务器使用 NVIDIA GPU；需要 CPU 试算时用 CC_BACKEND=cpu CC_DEVICE=cpu 覆盖。
+    "cc_backend": "torch",
     "cc_device": "cuda",
     "cc_threads": 0,
     "cc_batch_chunks": 8,

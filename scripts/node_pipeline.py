@@ -9,8 +9,8 @@ backend.  Consecutive minute blocks are then stacked in groups of ``save_every``
 
 The output ``data`` array has shape ``(source, lag, receiver)``.  For
 ``pair_mode=all_pairs`` only the upper-triangle pairs are computed; the lower
-triangle is filled by reversing the lag axis, and the diagonal contains the
-autocorrelation of each node.
+triangle is filled by reversing the lag axis.  The diagonal is zero by default
+and is computed only when ``include_autocorr`` is enabled.
 """
 
 from __future__ import annotations
@@ -23,13 +23,21 @@ from pathlib import Path
 import numpy as np
 from scipy.signal import resample_poly
 
+from dasqt.features.dispersion.backend.components.backends import (
+    cc_backend,
+    torch_cc_backend,
+)
 from dasqt.features.dispersion.backend.components.ccf.folder_pipeline import (
     save_stack_shots_mat,
+)
+from dasqt.features.dispersion.backend.components.ccf.spectrum_cache import (
+    build_spectrum_cache,
 )
 from dasqt.features.dispersion.backend.components.ccf.stacking import (
     stack_pairwise_cubes,
 )
 from dasqt.features.dispersion.backend.components.processors.cc_processor import (
+    _build_prepro_params,
     compute_cc_shot,
 )
 
@@ -47,6 +55,7 @@ class NodeCCFConfig:
     data_dir: Path
     output_dir: Path
     read_mode: str = "preload"
+    include_autocorr: bool = False
     pair_mode: str = "all_pairs"
     cc_len: float = 5.0
     step_s: float = 5.0
@@ -66,9 +75,14 @@ def _pair_indices(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     x = catalog.distances_m
     if config.pair_mode == "all_pairs":
+        first_receiver = 0 if config.include_autocorr else 1
         return (
-            np.asarray([i for i in range(len(x)) for j in range(i, len(x))]),
-            np.asarray([j for i in range(len(x)) for j in range(i, len(x))]),
+            np.asarray(
+                [i for i in range(len(x)) for j in range(i + first_receiver, len(x))]
+            ),
+            np.asarray(
+                [j for i in range(len(x)) for j in range(i + first_receiver, len(x))]
+            ),
             np.arange(len(x)),
         )
     if config.pair_mode != "sliding":
@@ -103,12 +117,101 @@ def _compute_dense_gather(data: np.ndarray, meta: dict, params: dict) -> np.ndar
         )
         if output is None:
             output = np.empty((nchan, nchan, gather.shape[0]), dtype=np.float32)
-        for receiver_index in range(source_index, nchan):
+        receiver_start = source_index if params.get("include_autocorr", False) else source_index + 1
+        for receiver_index in range(receiver_start, nchan):
             trace = np.asarray(gather[:, receiver_index], dtype=np.float32)
             output[source_index, receiver_index, :] = trace
             if receiver_index != source_index:
                 output[receiver_index, source_index, :] = trace[::-1]
     return output
+
+
+def _compute_dense_gather_batched(
+    data: np.ndarray,
+    meta: dict,
+    params: dict,
+    *,
+    include_autocorr: bool,
+) -> np.ndarray:
+    """Compute one minute gather with one GPU prewhitening pass.
+
+    The DAS spectrum cache preprocesses each short window once, keeps the
+    spectra on the accelerator, and correlates only the upper-triangle pairs.
+    The lower triangle is filled by lag reversal.  This avoids repeating the
+    same receiver preprocessing for every source node.
+    """
+    import torch
+
+    if str(params.get("_runtime_cc_backend", params.get("cc_backend", "cpu"))) != "torch":
+        return _compute_dense_gather(data, meta, params)
+
+    nchan = int(data.shape[1])
+    prepro = _build_prepro_params(meta, params, np.arange(nchan, dtype=int))
+    chunk_npts = int(prepro["npts_chunk"])
+    nwin = int(data.shape[0] // chunk_npts)
+    if nwin <= 0:
+        raise ValueError("Data length is too short for one correlation window")
+    data = np.asarray(data[: nwin * chunk_npts], dtype=params.get("cc_dtype", "float32"))
+    spectra, valid_masks, nfft = build_spectrum_cache(
+        data,
+        prepro,
+        mm=nwin,
+        chunk_npts=chunk_npts,
+        max_over_std=float(prepro.get("max_over_std", 1.0e30)),
+    )
+    if not all(np.all(np.asarray(mask)) for mask in valid_masks):
+        LOG.warning("invalid channels found; falling back to DAS compatibility path")
+        return _compute_dense_gather(data, meta, params)
+
+    batch_chunks = max(int(params.get("cc_batch_chunks", 8)), 1)
+    cube_batches: list[np.ndarray] = []
+    for batch_start in range(0, nwin, batch_chunks):
+        batch_stop = min(nwin, batch_start + batch_chunks)
+        spectra_batch = torch.stack(spectra[batch_start:batch_stop], dim=0)
+        batch_size = batch_stop - batch_start
+        pair_source, pair_receiver = np.triu_indices(
+            nchan, k=0 if include_autocorr else 1
+        )
+        if pair_source.size == 0:
+            raise ValueError("No station pairs were selected")
+        source_spectra = spectra_batch[:, pair_source, :]
+        receiver_spectra = spectra_batch[:, pair_receiver, :]
+        with torch.inference_mode():
+            pair_spectra = torch.conj(source_spectra) * receiver_spectra
+            full_spectra = torch_cc_backend._hermitian_complete(pair_spectra, nfft)
+            full_spectra[..., 0] = 0
+            corr_device = torch.real(
+                torch.fft.ifftshift(
+                    torch.fft.ifft(full_spectra, n=nfft, dim=-1), dim=-1
+                )
+            )
+        lag_axis = np.arange(-nfft // 2, nfft // 2) / float(prepro["samp_freq"])
+        lag_indices = np.where(np.abs(lag_axis) <= float(prepro["maxlag"]))[0]
+        corr_np = corr_device[..., lag_indices].detach().cpu().numpy().astype(
+            np.float32, copy=False
+        )
+        cube = np.zeros(
+            (batch_size, nchan, nchan, int(corr_np.shape[-1])), dtype=np.float32
+        )
+        cube[:, pair_source, pair_receiver, :] = corr_np
+        cross_pair = pair_source != pair_receiver
+        cube[:, pair_receiver[cross_pair], pair_source[cross_pair], :] = corr_np[
+            :, cross_pair, ::-1
+        ]
+        if cube is not None:
+            cube_batches.append(cube)
+        del spectra_batch
+    if not cube_batches:
+        raise ValueError("No station pairs were selected")
+    return np.asarray(
+        stack_pairwise_cubes(
+            np.concatenate(cube_batches, axis=0),
+            dt=float(meta["dt"]),
+            smethod=str(params.get("stacking_method", "pws")),
+            params=params,
+        ),
+        dtype=np.float32,
+    )
 
 
 def _stack_gathers(gathers: list[np.ndarray], dt: float, params: dict) -> np.ndarray:
@@ -141,6 +244,12 @@ def run_node_ccf(config: NodeCCFConfig) -> Path:
     source, receiver, _ = _pair_indices(catalog, config)
     if config.pair_mode != "all_pairs":
         raise ValueError("MAT output currently supports pair_mode=all_pairs only")
+    LOG.info(
+        "selected %d stations, computing %d unique station pairs%s",
+        len(catalog.stations),
+        len(source),
+        " including autocorrelation" if config.include_autocorr else "",
+    )
     reader = NodeSACReader(catalog, config.dtype)
     config.output_dir.mkdir(parents=True, exist_ok=True)
     meta = {
@@ -158,6 +267,7 @@ def run_node_ccf(config: NodeCCFConfig) -> Path:
         "cc_method": "xcorr",
         "cc_backend": "cpu",
         "cc_dtype": config.dtype,
+        "include_autocorr": config.include_autocorr,
         "max_over_std": 1.0e30,
         "smooth_N": 5,
         "smoothspect_N": 5,
@@ -168,6 +278,24 @@ def run_node_ccf(config: NodeCCFConfig) -> Path:
     cc_params.update(
         {"cc_len": config.cc_len, "maxlag": config.maxlag, "cc_dtype": config.dtype}
     )
+    runtime = cc_backend.diagnose_runtime(
+        str(cc_params.get("cc_backend", "auto")),
+        str(cc_params.get("cc_device", "auto")),
+        config.dtype,
+    )
+    cc_params["_runtime_cc_backend"] = runtime.actual_backend
+    cc_params["_runtime_cc_device"] = runtime.actual_device
+    LOG.info(
+        "CC runtime backend=%s device=%s (requested %s/%s)",
+        runtime.actual_backend,
+        runtime.actual_device,
+        runtime.requested_backend,
+        runtime.requested_device,
+    )
+    if str(cc_params.get("cc_device", "auto")) == "cuda" and runtime.actual_device != "cuda":
+        raise RuntimeError(
+            "CUDA was requested but is unavailable; check the DAS Python environment and NVIDIA driver"
+        )
     time_downsample = max(int(cc_params.get("time_downsample", 1)), 1)
     if time_downsample > 1:
         LOG.info(
@@ -220,6 +348,7 @@ def run_node_ccf(config: NodeCCFConfig) -> Path:
                 "cc_len": config.cc_len,
                 "step_s": config.step_s,
                 "read_mode": config.read_mode,
+                "include_autocorr": config.include_autocorr,
                 "cc_backend": str(cc_params.get("cc_backend", "auto")),
                 "cc_device": str(cc_params.get("cc_device", "auto")),
                 "pair_mode": config.pair_mode,
@@ -288,8 +417,11 @@ def run_node_ccf(config: NodeCCFConfig) -> Path:
                 # Concatenating independent windows lets the established DAS
                 # kernel batch them without changing the configured step/overlap.
                 minute_data = np.concatenate(pieces, axis=0)
-                minute_gather = _compute_dense_gather(
-                    minute_data, meta, cc_params
+                minute_gather = _compute_dense_gather_batched(
+                    minute_data,
+                    meta,
+                    cc_params,
+                    include_autocorr=config.include_autocorr,
                 )
                 append_minute(cursor, minute_gather, len(window_starts), block_end)
             cursor = block_end

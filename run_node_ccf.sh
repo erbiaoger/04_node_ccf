@@ -13,10 +13,9 @@ CONFIG="${CONFIG:-${SCRIPT_DIR}/config/cc_config.jsonc}" # 节点配置；内部
 [[ -z "${CSV}" ]] && CSV="${SCRIPT_DIR}/config/line_380_stations.csv"
 [[ -z "${OUT_DIR}" ]] && OUT_DIR="${SCRIPT_DIR}/outputs/node_ccf"
 ARGS=(--config "${CONFIG}" --csv "${CSV}" --output-dir "${OUT_DIR}")
-[[ -n "${CSV}" ]] && ARGS+=(--csv "${CSV}")
 [[ -n "${DATA_DIR}" ]] && ARGS+=(--data-dir "${DATA_DIR}")
-[[ -n "${OUT_DIR}" ]] && ARGS+=(--output-dir "${OUT_DIR}")
 [[ -n "${READ_MODE:-}" ]] && ARGS+=(--read-mode "${READ_MODE}") # preload 或 window
+[[ "${INCLUDE_AUTOCORR:-0}" == "1" ]] && ARGS+=(--include-autocorr) # 是否计算自相关
 [[ -n "${PAIR_MODE:-}" ]] && ARGS+=(--pair-mode "${PAIR_MODE}") # all_pairs 或 sliding
 [[ -n "${OFFSET_M:-}" ]] && ARGS+=(--offset-m "${OFFSET_M}") # sliding 接收范围，米
 [[ -n "${DSHOT_M:-}" ]] && ARGS+=(--dshot-m "${DSHOT_M}") # sliding 震源步长，米
