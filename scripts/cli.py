@@ -35,11 +35,10 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from node_pipeline import NodeCCFConfig, run_node_ccf
-
 from dasqt.features.dispersion.backend.components.ccf.folder_pipeline import (
     load_config_json,
 )
+from node_pipeline import NodeCCFConfig, run_node_ccf
 
 
 def _config_relative_path(value: object, config_path: Path) -> Path:

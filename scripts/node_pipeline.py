@@ -21,8 +21,6 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import numpy as np
-from scipy.signal import resample_poly
-
 from dasqt.features.dispersion.backend.components.backends import (
     cc_backend,
     torch_cc_backend,
@@ -40,6 +38,7 @@ from dasqt.features.dispersion.backend.components.processors.cc_processor import
     _build_prepro_params,
     compute_cc_shot,
 )
+from scipy.signal import resample_poly
 
 try:  # Supports both ``python -m`` and direct CLI execution.
     from .node_reader import NodeCatalog, NodeSACReader, load_node_catalog
