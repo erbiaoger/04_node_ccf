@@ -2,6 +2,14 @@
 
 本目录把排序 CSV 和 `/Volumes/CSIM/2026SaErTuoHai_passive` 这类节点 SAC 数据接入现有 DAS CCF 计算。读取器只映射 SAC 数据区，不把 2 TB 级文件整体载入内存；互相关调用现有 DAS 的 `compute_cc_shot` 核心。
 
+本仓库依赖已有 DAS/dasQt 源码仓库和其中的 `.venv`。服务器上默认寻找
+`/csim2/zhangzhiyu/MyProjects/DAS_Procee_Show`，本机默认寻找
+`/Users/zhangzhiyu/MyProjects/dasQt`；也可以显式指定：
+
+```bash
+DASQT_REPO_DIR=/path/to/DAS_Procee_Show ./run_node_ccf.sh
+```
+
 CSV 最少包含两列：
 
 ```csv
@@ -16,6 +24,9 @@ station_id,distance_m
 cd /Users/zhangzhiyu/MyProjects/dasQt
 bash examples/04_node_ccf/run_node_ccf.sh /path/to/stations.csv
 ```
+
+从独立克隆目录运行时直接执行 `./run_node_ccf.sh` 即可；脚本会自动调用外部
+DAS 仓库的 `_shell_common.sh` 同等环境逻辑，并使用本仓库的配置、CSV 和输出目录。
 
 当前配置已经填入第380线的 CSV，因此也可以直接运行整条第380线：
 

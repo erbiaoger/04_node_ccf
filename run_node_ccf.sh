@@ -2,18 +2,17 @@
 # 节点 SAC 互相关一键入口：参数说明见下方默认值。
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/_shell_common.sh"
 CSV="${1:-}" # 排序 CSV；若配置含 station_csv 可省略
 DATA_DIR="${2:-}" # 可由配置中的 node_data_dir 提供；空值时使用 CLI 默认节点目录
 OUT_DIR="${3:-}" # 可由配置中的 node_output_dir 提供；空值时使用 CLI 默认输出目录
-CONFIG="${CONFIG:-${ROOT}/examples/04_node_ccf/config/cc_config.jsonc}" # 节点配置；内部继承 DAS cc_config.jsonc
-cd "${ROOT}"
-if [[ ! -x "${ROOT}/.venv/bin/python" ]]; then
-    echo "错误：未找到项目 Python 环境：${ROOT}/.venv/bin/python" >&2
-    echo "请先在项目根目录执行：uv sync" >&2
-    exit 1
-fi
-ARGS=(--config "${CONFIG}")
+CONFIG="${CONFIG:-${SCRIPT_DIR}/config/cc_config.jsonc}" # 节点配置；内部继承 DAS cc_config.jsonc
+# 独立仓库运行时，当前目录是 DASQT_REPO_DIR；因此将本仓库的默认输入/输出
+# 绝对路径显式传给 CLI，避免把相对路径误解析到外部 DAS 仓库。
+[[ -z "${CSV}" ]] && CSV="${SCRIPT_DIR}/config/line_380_stations.csv"
+[[ -z "${OUT_DIR}" ]] && OUT_DIR="${SCRIPT_DIR}/outputs/node_ccf"
+ARGS=(--config "${CONFIG}" --csv "${CSV}" --output-dir "${OUT_DIR}")
 [[ -n "${CSV}" ]] && ARGS+=(--csv "${CSV}")
 [[ -n "${DATA_DIR}" ]] && ARGS+=(--data-dir "${DATA_DIR}")
 [[ -n "${OUT_DIR}" ]] && ARGS+=(--output-dir "${OUT_DIR}")
@@ -27,4 +26,4 @@ ARGS=(--config "${CONFIG}")
 [[ -n "${SAVE_EVERY:-}" ]] && ARGS+=(--save-every "${SAVE_EVERY}") # 每多少分钟保存一个 MAT
 [[ -n "${START_UTC:-}" ]] && ARGS+=(--start-utc "${START_UTC}") # 可选 UTC 起始时间
 [[ -n "${END_UTC:-}" ]] && ARGS+=(--end-utc "${END_UTC}") # 可选 UTC 结束时间
-uv run --project "${ROOT}" --no-sync python examples/04_node_ccf/scripts/cli.py "${ARGS[@]}"
+run_uv_python "${SCRIPT_DIR}/scripts/cli.py" "${ARGS[@]}"
