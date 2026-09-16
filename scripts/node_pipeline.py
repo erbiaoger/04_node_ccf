@@ -48,6 +48,7 @@ except ImportError:  # pragma: no cover - exercised by the shell entrypoint
 LOG = logging.getLogger(__name__)
 _GPU_PATH_LOGGED = False
 _GPU_STACK_LOGGED = False
+_GPU_FK_LOGGED = False
 
 
 @dataclass(frozen=True)
@@ -255,6 +256,16 @@ def _compute_dense_gather_batched(
         ].flip(-1)
         fk_params = params.get("fk_filt", {})
         if bool(fk_params.get("enabled", params.get("fk_enabled", False))):
+            global _GPU_FK_LOGGED
+            if not _GPU_FK_LOGGED:
+                LOG.info(
+                    "GPU FK filtering active: cmin=%s m/s, cmax=%s m/s, sign=%s, dx=%s m",
+                    fk_params.get("cmin", params.get("fk_cmin", 10.0)),
+                    fk_params.get("cmax", params.get("fk_cmax", 2000.0)),
+                    fk_params.get("sgn", params.get("fk_sgn", "both")),
+                    meta.get("dx", 1.0),
+                )
+                _GPU_FK_LOGGED = True
             with torch.inference_mode():
                 cube = torch_cc_backend.fk_filter(
                     cube,
@@ -468,6 +479,10 @@ def run_node_ccf(config: NodeCCFConfig) -> Path:
                 "cc_backend": str(cc_params.get("cc_backend", "auto")),
                 "cc_device": str(cc_params.get("cc_device", "auto")),
                 "pair_mode": config.pair_mode,
+                "fk_enabled": bool(fk_params.get("enabled", False)),
+                "fk_cmin": float(fk_params.get("cmin", 10.0)),
+                "fk_cmax": float(fk_params.get("cmax", 2000.0)),
+                "fk_sgn": str(fk_params.get("sgn", "both")),
             },
         )
         LOG.info(
