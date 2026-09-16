@@ -35,7 +35,8 @@
     "cc_backend": "torch",
     "cc_device": "cuda",
     "cc_threads": 0,
-    "cc_batch_chunks": 8,
+    // 每分钟通常有 12 个 10 s/5 s 短窗；16 可让整分钟尽量一次进入 GPU。
+    "cc_batch_chunks": 16,
     "cc_shot_batch_size": 16,
     "cc_memory_budget_mb": 512000,
 
