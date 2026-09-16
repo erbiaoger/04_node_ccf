@@ -37,8 +37,6 @@ READ_MODE=preload CC_BACKEND=torch CC_DEVICE=cuda CC_BATCH_CHUNKS=8 \
 
 `CC_BATCH_CHUNKS` 是一次送入后端的短窗数量；一分钟内的短窗会先按该数量分批处理，再完成一分钟叠加。预加载模式会按实际数据长度申请内存，请先确认服务器可用内存足够。
 
-预加载内存可按 `样本数 × 台站数 × dtype 字节数` 估算；例如日志中的 `515540500 × 34` 个 `float32` 样本约为 65.3 GiB。程序会在分配前打印估算值，并由 `preload_max_gib`（默认 800 GiB）拦截异常大的配置。相同输出目录同时只允许一个计算进程，避免重复启动多个预加载进程叠加占用内存；SAC 文件读取产生的 Linux 文件页缓存属于系统缓存，不等于该 Python 进程的 RSS。
-
 当 `CC_BACKEND=torch` 且 `CC_DEVICE=cuda` 时，短窗预处理、互相关 FFT、分钟叠加和 `save_every` 汇总都会在同一块 CUDA 设备上执行；日志会打印 `Torch CUDA device=...`、`GPU pairwise correlation active` 和 `GPU pairwise stacking active`。CUDA 模式遇到设备不可用或预处理无效数据时会直接报错，不会静默改用 CPU。`nvidia-smi` 的利用率是采样瞬时值，单分钟只有十几个短窗时可能显示较低，但上述日志可以确认实际执行路径。
 
 当前配置已经填入第380线的 CSV，因此也可以直接运行整条第380线：

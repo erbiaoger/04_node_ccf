@@ -8,8 +8,6 @@
     "node_output_dir": "./outputs/node_ccf",
     // preload：完整共同时间段一次性载入内存；window：逐个短窗读取。
     "read_mode": "preload",
-    // 预加载峰值保护上限，单位 GiB；为 1 TiB 主机保留系统余量。
-    "preload_max_gib": 800.0,
     "pair_mode": "all_pairs",
     // 每多少分钟保存一个 MAT 结果；末尾不足一个时间段也单独保存。
     "save_every": 30,
