@@ -1,0 +1,82 @@
+// 节点 SAC CCF 完整配置。参数名称与 examples/03_ccf/config/cc_config.jsonc 一致。
+// 节点流程默认先加载本文件，再用命令行 --config 指定的文件覆盖同名参数。
+{
+    // ---------- 节点输入与输出 ----------
+    // 排序 CSV；也可以在一键脚本第一个参数中传入。
+    "station_csv": "examples/04_node_ccf/config/line_380_stations.csv",
+    "node_data_dir": "/Volumes/CSIM/2026SaErTuoHai_passive",
+    "node_output_dir": "examples/04_node_ccf/outputs/node_ccf",
+    "pair_mode": "all_pairs",
+    // 每多少分钟保存一个 MAT 结果；末尾不足一个时间段也单独保存。
+    "save_every": 30,
+
+    // ---------- 互相关预处理 ----------
+    "freqmin": 2.0,
+    "freqmax": 30.0,
+    "freq_norm": "rma",
+    "time_norm": "rma",
+    "cc_method": "xcorr",
+    "cc_len": 10.0,
+    "cc_step_s": 5.0,
+    // 第一层叠加时间长度，单位秒；DAS 风格默认每 1 分钟一个时间段。
+    "minute_stack_s": 60.0,
+    "maxlag": 4.0,
+    "max_over_std": 1000000000,
+    "smooth_N": 5,
+    "smoothspect_N": 5,
+    "time_downsample": 1,
+    "space_downsample": 1,
+    "cc_dtype": "float32",
+
+    // ---------- 数值后端 ----------
+    "cc_backend": "torch",
+    "cc_device": "mps",
+    "cc_threads": 0,
+    "cc_batch_chunks": 8,
+    "cc_shot_batch_size": 16,
+    "cc_memory_budget_mb": 512000,
+
+    // ---------- 滑动炮集几何 ----------
+    // all_pairs=全部无序台站对；sliding=按 offset/dshot 滑动炮集。
+    "offset": 50.0,
+    "dshot": 2.5,
+    "xshot": 1.0,
+
+    // ---------- FK 与显示兼容参数 ----------
+    "fk_enabled": false,
+    "fk_cmin": 100.0,
+    "fk_cmax": 800.0,
+    "fk_sgn": "both",
+    "cc_wigb": false,
+    "cc_fill": "both",
+    "cc_region": "All",
+    "ddx": 3,
+    "ddt": 1,
+
+    // ---------- TSI 兼容参数 ----------
+    "cc_enhance_method": "raw",
+    "tsi_files_per_group": 5,
+    "tsi_iterations": 4,
+    "tsi_stop_rel_l1": 0.005,
+    "tsi_mode": "single_shot_local_cc",
+    "tsi_shot_batch_size": 32,
+    "tsi_show_progress": true,
+    "tsi_taper_enabled": true,
+    "tsi_taper_vmin": 100.0,
+    "tsi_taper_vmax": 1200.0,
+    "tsi_taper_outside_scale": 0.25,
+    "tsi_taper_shoulder_fraction": 0.25,
+    "tsi_local_expand_offsets": 0,
+
+    // ---------- 兼容字段 ----------
+    "acf_display_percentile": 90.0,
+    "acf_time_norm": "rma",
+    "acf_freq_norm": "no",
+    "stacking_method": "pws",
+    "bp_fmin": 5.0,
+    "bp_fmax": 50.0,
+    "next_data": 30,
+    "sps": 50.0,
+    "samp_freq": 50.0,
+    "schema_version": 3
+}

@@ -1,0 +1,15 @@
+# 运行结果体积较大，不纳入代码仓库
+outputs/
+
+# Python 缓存与本地工具文件
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.DS_Store
+
+# 本地编辑器与环境文件
+.vscode/
+.idea/
+.env
+.venv/
