@@ -69,15 +69,10 @@ done
 
 INPUT_DIR="$(_node_abs_path "${INPUT_DIR}")"
 OUTPUT_DIR="$(_node_abs_path "${OUTPUT_DIR}")"
-ensure_dasqt_env
-STACK_SCRIPT="${DASQT_REPO_DIR}/examples/03_ccf/scripts/stack_saved_cc_mat.py"
-if [[ ! -f "${STACK_SCRIPT}" ]]; then
-  echo "错误：未找到 DAS 二次叠加脚本：${STACK_SCRIPT}" >&2
-  exit 1
-fi
+STACK_SCRIPT="${SCRIPT_DIR}/scripts/stack_node_cc_mat.py"
 
-# 先复用 DAS 脚本生成 restack_*.mat；关闭其默认绘图，避免用均匀 dx
-# 覆盖节点真实坐标图。节点专用 plot_node_ccf.py 随后读取 profileX 出图。
+# 使用本仓库的节点叠加入口；其内部直接调用 DAS stack_cc_chunks 后端，
+# 同时把 profileX 写入 restack MAT，避免依赖外部仓库是否包含 03_ccf 示例。
 STACK_ARGS=(
   "${STACK_SCRIPT}"
   --input-dir "${INPUT_DIR}"
@@ -90,8 +85,6 @@ STACK_ARGS=(
   --cc-backend "${CC_BACKEND}"
   --cc-device "${CC_DEVICE}"
   --cc-dtype "${CC_DTYPE}"
-  --no-save-summary-plot
-  --no-save-shot-figures
 )
 run_uv_python "${STACK_ARGS[@]}"
 
