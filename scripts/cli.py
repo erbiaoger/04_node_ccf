@@ -90,9 +90,7 @@ def main() -> None:
         choices=("auto", "cpu", "cuda", "mps"),
         help="计算设备，例如 cuda",
     )
-    parser.add_argument(
-        "--cc-batch-chunks", type=int, help="一次送入后端的短窗数量"
-    )
+    parser.add_argument("--cc-batch-chunks", type=int, help="一次送入后端的短窗数量")
     parser.add_argument(
         "--minute-stack-s", type=float, help="先将多少秒短窗叠加为一个分钟段"
     )

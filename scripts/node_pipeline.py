@@ -48,6 +48,7 @@ except ImportError:  # pragma: no cover - exercised by the shell entrypoint
 
 LOG = logging.getLogger(__name__)
 _GPU_PATH_LOGGED = False
+_GPU_STACK_LOGGED = False
 
 
 @dataclass(frozen=True)
@@ -118,7 +119,9 @@ def _compute_dense_gather(data: np.ndarray, meta: dict, params: dict) -> np.ndar
         )
         if output is None:
             output = np.empty((nchan, nchan, gather.shape[0]), dtype=np.float32)
-        receiver_start = source_index if params.get("include_autocorr", False) else source_index + 1
+        receiver_start = (
+            source_index if params.get("include_autocorr", False) else source_index + 1
+        )
         for receiver_index in range(receiver_start, nchan):
             trace = np.asarray(gather[:, receiver_index], dtype=np.float32)
             output[source_index, receiver_index, :] = trace
@@ -144,7 +147,10 @@ def _torch_stack_pairwise_cubes(cubes, method: str):
     # that exact layout while running all sources in one Torch call.
     gathers = cubes.permute(1, 0, 3, 2).contiguous()
     stacked = torch_cc_backend.stack_chunks(
-        gathers, method, device=str(cubes.device), dtype="float64" if cubes.dtype == torch.float64 else "float32"
+        gathers,
+        method,
+        device=str(cubes.device),
+        dtype="float64" if cubes.dtype == torch.float64 else "float32",
     ).permute(0, 2, 1)
     # Match DAS ``stack_cc`` post-processing: normalize each receiver trace
     # along lag, then remove its lag mean.
@@ -169,7 +175,10 @@ def _compute_dense_gather_batched(
     """
     import torch
 
-    if str(params.get("_runtime_cc_backend", params.get("cc_backend", "cpu"))) != "torch":
+    if (
+        str(params.get("_runtime_cc_backend", params.get("cc_backend", "cpu")))
+        != "torch"
+    ):
         return _compute_dense_gather(data, meta, params)
     global _GPU_PATH_LOGGED
     if not _GPU_PATH_LOGGED:
@@ -187,7 +196,9 @@ def _compute_dense_gather_batched(
     nwin = int(data.shape[0] // chunk_npts)
     if nwin <= 0:
         raise ValueError("Data length is too short for one correlation window")
-    data = np.asarray(data[: nwin * chunk_npts], dtype=params.get("cc_dtype", "float32"))
+    data = np.asarray(
+        data[: nwin * chunk_npts], dtype=params.get("cc_dtype", "float32")
+    )
     spectra, valid_masks, nfft = build_spectrum_cache(
         data,
         prepro,
@@ -256,25 +267,31 @@ def _compute_dense_gather_batched(
 
 
 def _stack_gathers(gathers: list[np.ndarray], dt: float, params: dict) -> np.ndarray:
-    global _GPU_PATH_LOGGED
+    global _GPU_STACK_LOGGED
     runtime_device = str(params.get("_runtime_cc_device", "cpu"))
-    if str(params.get("_runtime_cc_backend", params.get("cc_backend", "cpu"))) == "torch" and runtime_device != "cpu":
+    if (
+        str(params.get("_runtime_cc_backend", params.get("cc_backend", "cpu")))
+        == "torch"
+        and runtime_device != "cpu"
+    ):
         import torch
 
-        cubes = torch.as_tensor(np.asarray(gathers), device=runtime_device, dtype=torch.float32)
+        cubes = torch.as_tensor(
+            np.asarray(gathers), device=runtime_device, dtype=torch.float32
+        )
         stacked = _torch_stack_pairwise_cubes(
             cubes, str(params.get("stacking_method", "pws"))
         )
         if stacked.device.type == "cuda":
             torch.cuda.synchronize(stacked.device)
-        if not _GPU_PATH_LOGGED:
+        if not _GPU_STACK_LOGGED:
             LOG.info(
                 "GPU pairwise stacking active: device=%s, cubes=%s, method=%s",
                 runtime_device,
                 tuple(cubes.shape),
                 params.get("stacking_method", "pws"),
             )
-            _GPU_PATH_LOGGED = True
+            _GPU_STACK_LOGGED = True
         return stacked.detach().cpu().numpy().astype(np.float32, copy=False)
     return np.asarray(
         stack_pairwise_cubes(
@@ -362,7 +379,10 @@ def run_node_ccf(config: NodeCCFConfig) -> Path:
             torch.cuda.get_device_name(),
             torch.cuda.get_device_capability(),
         )
-    if str(cc_params.get("cc_device", "auto")) == "cuda" and runtime.actual_device != "cuda":
+    if (
+        str(cc_params.get("cc_device", "auto")) == "cuda"
+        and runtime.actual_device != "cuda"
+    ):
         raise RuntimeError(
             "CUDA was requested but is unavailable; check the DAS Python environment and NVIDIA driver"
         )
@@ -457,9 +477,9 @@ def run_node_ccf(config: NodeCCFConfig) -> Path:
             full_data.shape[1],
         )
         if time_downsample > 1:
-            full_data = resample_poly(
-                full_data, 1, time_downsample, axis=0
-            ).astype(config.dtype, copy=False)
+            full_data = resample_poly(full_data, 1, time_downsample, axis=0).astype(
+                config.dtype, copy=False
+            )
             meta["dt"] = time_downsample / reader.fs
         else:
             meta["dt"] = 1.0 / reader.fs
@@ -481,9 +501,7 @@ def run_node_ccf(config: NodeCCFConfig) -> Path:
                 pieces = []
                 for window_start in window_starts:
                     start_index = round((window_start - start) * effective_fs)
-                    pieces.append(
-                        full_data[start_index : start_index + window_npts, :]
-                    )
+                    pieces.append(full_data[start_index : start_index + window_npts, :])
                 # Concatenating independent windows lets the established DAS
                 # kernel batch them without changing the configured step/overlap.
                 minute_data = np.concatenate(pieces, axis=0)
