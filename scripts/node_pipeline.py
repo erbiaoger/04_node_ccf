@@ -15,6 +15,7 @@ and is computed only when ``include_autocorr`` is enabled.
 
 from __future__ import annotations
 
+import atexit
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -48,6 +49,7 @@ except ImportError:  # pragma: no cover - exercised by the shell entrypoint
 LOG = logging.getLogger(__name__)
 _GPU_PATH_LOGGED = False
 _GPU_STACK_LOGGED = False
+_OUTPUT_LOCK_HANDLES = []
 
 
 @dataclass(frozen=True)
@@ -69,6 +71,52 @@ class NodeCCFConfig:
     end_utc: str | None = None
     cc_params: dict | None = None
     save_every: int = 30  # number of one-minute blocks per MAT file
+
+
+def _acquire_output_lock(output_dir: Path) -> None:
+    """Prevent two full-data jobs from multiplying RAM usage in one output dir."""
+    try:
+        import fcntl
+    except ImportError:  # pragma: no cover - Linux server has fcntl
+        return
+    output_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = output_dir / ".node_ccf.lock"
+    handle = lock_path.open("w", encoding="utf-8")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as exc:
+        handle.close()
+        raise RuntimeError(
+            f"Another node CCF process is already using output_dir={output_dir}"
+        ) from exc
+    _OUTPUT_LOCK_HANDLES.append(handle)
+    atexit.register(_release_output_locks)
+
+
+def _release_output_locks() -> None:
+    try:
+        import fcntl
+    except ImportError:  # pragma: no cover
+        return
+    while _OUTPUT_LOCK_HANDLES:
+        handle = _OUTPUT_LOCK_HANDLES.pop()
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
+
+
+def _memory_snapshot() -> str:
+    """Return current process RSS/virtual size when Linux procfs is available."""
+    try:
+        values = {}
+        for line in Path("/proc/self/status").read_text(encoding="utf-8").splitlines():
+            key, _, value = line.partition(":")
+            if key in {"VmRSS", "VmSize"}:
+                values[key] = value.strip()
+        if values:
+            return f"RSS={values.get('VmRSS', '?')}, VMS={values.get('VmSize', '?')}"
+    except OSError:
+        pass
+    return "RSS/VMS unavailable"
 
 
 def _pair_indices(
@@ -308,6 +356,7 @@ def run_node_ccf(config: NodeCCFConfig) -> Path:
     logging.basicConfig(
         level=logging.INFO, format="[%(asctime)s] %(levelname)s %(message)s"
     )
+    _acquire_output_lock(config.output_dir)
     catalog = load_node_catalog(config.csv_path, config.data_dir)
     if config.minute_stack_s <= 0:
         raise ValueError("minute_stack_s must be positive")
@@ -403,8 +452,6 @@ def run_node_ccf(config: NodeCCFConfig) -> Path:
     )
     if start < catalog.start_timestamp or end > catalog.end_timestamp or start >= end:
         raise ValueError("Requested UTC range is outside the common catalog interval")
-    minute_block: list[np.ndarray] = []
-    minute_start = None
     group_block: list[np.ndarray] = []
     group_start = None
     group_short_count = 0
@@ -468,6 +515,21 @@ def run_node_ccf(config: NodeCCFConfig) -> Path:
     if read_mode == "preload":
         # Read the complete common interval once.  The following minute loops
         # only slice this in-memory array, so SAC I/O is not repeated.
+        raw_npts = round((end - start) * reader.fs)
+        raw_bytes = raw_npts * len(catalog.stations) * np.dtype(config.dtype).itemsize
+        downsample_peak = raw_bytes * (1.0 + 1.0 / time_downsample)
+        max_preload_gib = float(cc_params.get("preload_max_gib", 800.0))
+        LOG.info(
+            "preload estimate %.3f GiB; expected peak <= %.3f GiB (%s)",
+            raw_bytes / 1024**3,
+            downsample_peak / 1024**3,
+            _memory_snapshot(),
+        )
+        if downsample_peak > max_preload_gib * 1024**3:
+            raise MemoryError(
+                f"Estimated preload peak {downsample_peak / 1024**3:.3f} GiB exceeds "
+                f"preload_max_gib={max_preload_gib:.3f}; use read_mode=window or increase the limit"
+            )
         full_data, _ = reader.read_window(start, end - start)
         LOG.info(
             "preloaded %.3f GiB (%d samples x %d stations) into RAM",
@@ -475,6 +537,7 @@ def run_node_ccf(config: NodeCCFConfig) -> Path:
             full_data.shape[0],
             full_data.shape[1],
         )
+        LOG.info("after preload: %s", _memory_snapshot())
         if time_downsample > 1:
             full_data = resample_poly(full_data, 1, time_downsample, axis=0).astype(
                 config.dtype, copy=False
@@ -513,37 +576,52 @@ def run_node_ccf(config: NodeCCFConfig) -> Path:
                 append_minute(cursor, minute_gather, len(window_starts), block_end)
             cursor = block_end
     else:
-        # Low-memory compatibility path: read one short window at a time.
-        for window_start, (data, _) in reader.iter_windows(
-            start, end, config.cc_len, config.step_s
-        ):
+        # Low-memory path: read one minute at a time, then batch all overlapping
+        # short windows in that minute through the same GPU kernel as preload.
+        # Peak host memory is approximately one minute of all stations.
+        LOG.info(
+            "window mode: reading %.3f-second blocks; full interval stays on disk",
+            config.minute_stack_s,
+        )
+        cursor = start
+        while cursor + config.cc_len <= end + 1e-6:
+            block_end = min(cursor + config.minute_stack_s, end)
+            block_data, _ = reader.read_window(cursor, block_end - cursor)
             if time_downsample > 1:
-                data = resample_poly(data, 1, time_downsample, axis=0).astype(
-                    config.dtype, copy=False
-                )
+                block_data = resample_poly(
+                    block_data, 1, time_downsample, axis=0
+                ).astype(config.dtype, copy=False)
                 meta["dt"] = time_downsample / reader.fs
             else:
                 meta["dt"] = 1.0 / reader.fs
             meta["profileX"] = catalog.distances_m
-            if (
-                minute_start is not None
-                and window_start >= minute_start + config.minute_stack_s
+            effective_fs = 1.0 / meta["dt"]
+            window_npts = round(config.cc_len * effective_fs)
+            window_starts: list[float] = []
+            window_cursor = cursor
+            while (
+                window_cursor < block_end - 1e-6
+                and window_cursor + config.cc_len <= end + 1e-6
             ):
-                minute_gather = _stack_gathers(minute_block, meta["dt"], cc_params)
-                append_minute(
-                    minute_start, minute_gather, len(minute_block), window_start
+                window_starts.append(window_cursor)
+                window_cursor += config.step_s
+            if window_starts:
+                pieces = []
+                for window_start in window_starts:
+                    start_index = round((window_start - cursor) * effective_fs)
+                    pieces.append(
+                        block_data[start_index : start_index + window_npts, :]
+                    )
+                minute_data = np.concatenate(pieces, axis=0)
+                minute_gather = _compute_dense_gather_batched(
+                    minute_data,
+                    meta,
+                    cc_params,
+                    include_autocorr=config.include_autocorr,
                 )
-                minute_block, minute_start = [], None
-            minute_block.append(_compute_dense_gather(data, meta, cc_params))
-            if minute_start is None:
-                minute_start = window_start
-    if minute_block:
-        append_minute(
-            minute_start,
-            _stack_gathers(minute_block, meta["dt"], cc_params),
-            len(minute_block),
-            end,
-        )
+                append_minute(cursor, minute_gather, len(window_starts), block_end)
+            del block_data
+            cursor = block_end
     if group_block:
         save_group(group_block, group_start, end, group_short_count)
     if file_index == 0:
