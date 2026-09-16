@@ -47,6 +47,7 @@ except ImportError:  # pragma: no cover - exercised by the shell entrypoint
     from node_reader import NodeCatalog, NodeSACReader, load_node_catalog
 
 LOG = logging.getLogger(__name__)
+_GPU_PATH_LOGGED = False
 
 
 @dataclass(frozen=True)
@@ -126,6 +127,32 @@ def _compute_dense_gather(data: np.ndarray, meta: dict, params: dict) -> np.ndar
     return output
 
 
+def _torch_stack_pairwise_cubes(cubes, method: str):
+    """Stack ``(window, source, receiver, lag)`` cubes on the accelerator."""
+    import torch
+
+    if cubes.ndim != 4:
+        raise ValueError(f"Torch pairwise cubes must be 4D, got {tuple(cubes.shape)}")
+    method = str(method).lower()
+    if method not in {"linear", "pws"}:
+        raise ValueError(
+            "GPU pairwise stacking supports linear and pws; "
+            f"got stacking_method={method!r}"
+        )
+    # The established DAS stacker treats each source gather independently and
+    # flattens (lag, receiver) while calculating PWS.  A 4D batch preserves
+    # that exact layout while running all sources in one Torch call.
+    gathers = cubes.permute(1, 0, 3, 2).contiguous()
+    stacked = torch_cc_backend.stack_chunks(
+        gathers, method, device=str(cubes.device), dtype="float64" if cubes.dtype == torch.float64 else "float32"
+    ).permute(0, 2, 1)
+    # Match DAS ``stack_cc`` post-processing: normalize each receiver trace
+    # along lag, then remove its lag mean.
+    scale = torch.amax(torch.abs(stacked), dim=-1, keepdim=True)
+    stacked = stacked / torch.where(scale == 0, torch.ones_like(scale), scale)
+    return stacked - torch.mean(stacked, dim=-1, keepdim=True)
+
+
 def _compute_dense_gather_batched(
     data: np.ndarray,
     meta: dict,
@@ -144,6 +171,15 @@ def _compute_dense_gather_batched(
 
     if str(params.get("_runtime_cc_backend", params.get("cc_backend", "cpu"))) != "torch":
         return _compute_dense_gather(data, meta, params)
+    global _GPU_PATH_LOGGED
+    if not _GPU_PATH_LOGGED:
+        LOG.info(
+            "GPU pairwise correlation active: device=%s, short_windows=%d, stations=%d",
+            params.get("_runtime_cc_device", params.get("cc_device", "auto")),
+            int(data.shape[0]),
+            int(data.shape[1]),
+        )
+        _GPU_PATH_LOGGED = True
 
     nchan = int(data.shape[1])
     prepro = _build_prepro_params(meta, params, np.arange(nchan, dtype=int))
@@ -160,11 +196,17 @@ def _compute_dense_gather_batched(
         max_over_std=float(prepro.get("max_over_std", 1.0e30)),
     )
     if not all(np.all(np.asarray(mask)) for mask in valid_masks):
-        LOG.warning("invalid channels found; falling back to DAS compatibility path")
+        invalid = sum(int(np.count_nonzero(~np.asarray(mask))) for mask in valid_masks)
+        LOG.error("GPU preprocessing rejected %d window/channel values", invalid)
+        if str(params.get("_runtime_cc_device", "cpu")) in {"cuda", "mps"}:
+            raise RuntimeError(
+                "GPU CCF refused to fall back to CPU because preprocessing found "
+                f"{invalid} invalid window/channel values"
+            )
         return _compute_dense_gather(data, meta, params)
 
     batch_chunks = max(int(params.get("cc_batch_chunks", 8)), 1)
-    cube_batches: list[np.ndarray] = []
+    cube_batches = []
     for batch_start in range(0, nwin, batch_chunks):
         batch_stop = min(nwin, batch_start + batch_chunks)
         spectra_batch = torch.stack(spectra[batch_start:batch_stop], dim=0)
@@ -187,34 +229,53 @@ def _compute_dense_gather_batched(
             )
         lag_axis = np.arange(-nfft // 2, nfft // 2) / float(prepro["samp_freq"])
         lag_indices = np.where(np.abs(lag_axis) <= float(prepro["maxlag"]))[0]
-        corr_np = corr_device[..., lag_indices].detach().cpu().numpy().astype(
-            np.float32, copy=False
+        corr = corr_device[..., lag_indices]
+        pair_source_t = torch.as_tensor(pair_source, device=corr.device)
+        pair_receiver_t = torch.as_tensor(pair_receiver, device=corr.device)
+        cube = torch.zeros(
+            (batch_size, nchan, nchan, int(corr.shape[-1])),
+            dtype=corr.dtype,
+            device=corr.device,
         )
-        cube = np.zeros(
-            (batch_size, nchan, nchan, int(corr_np.shape[-1])), dtype=np.float32
-        )
-        cube[:, pair_source, pair_receiver, :] = corr_np
+        cube[:, pair_source_t, pair_receiver_t, :] = corr
         cross_pair = pair_source != pair_receiver
-        cube[:, pair_receiver[cross_pair], pair_source[cross_pair], :] = corr_np[
-            :, cross_pair, ::-1
-        ]
-        if cube is not None:
-            cube_batches.append(cube)
+        cross_pair_t = torch.as_tensor(cross_pair, device=corr.device)
+        cube[:, pair_receiver_t[cross_pair_t], pair_source_t[cross_pair_t], :] = corr[
+            :, cross_pair_t, :
+        ].flip(-1)
+        cube_batches.append(cube)
         del spectra_batch
     if not cube_batches:
         raise ValueError("No station pairs were selected")
-    return np.asarray(
-        stack_pairwise_cubes(
-            np.concatenate(cube_batches, axis=0),
-            dt=float(meta["dt"]),
-            smethod=str(params.get("stacking_method", "pws")),
-            params=params,
-        ),
-        dtype=np.float32,
+    stacked = _torch_stack_pairwise_cubes(
+        torch.cat(cube_batches, dim=0), str(params.get("stacking_method", "pws"))
     )
+    if stacked.device.type == "cuda":
+        torch.cuda.synchronize(stacked.device)
+    return stacked.detach().cpu().numpy().astype(np.float32, copy=False)
 
 
 def _stack_gathers(gathers: list[np.ndarray], dt: float, params: dict) -> np.ndarray:
+    global _GPU_PATH_LOGGED
+    runtime_device = str(params.get("_runtime_cc_device", "cpu"))
+    if str(params.get("_runtime_cc_backend", params.get("cc_backend", "cpu"))) == "torch" and runtime_device != "cpu":
+        import torch
+
+        cubes = torch.as_tensor(np.asarray(gathers), device=runtime_device, dtype=torch.float32)
+        stacked = _torch_stack_pairwise_cubes(
+            cubes, str(params.get("stacking_method", "pws"))
+        )
+        if stacked.device.type == "cuda":
+            torch.cuda.synchronize(stacked.device)
+        if not _GPU_PATH_LOGGED:
+            LOG.info(
+                "GPU pairwise stacking active: device=%s, cubes=%s, method=%s",
+                runtime_device,
+                tuple(cubes.shape),
+                params.get("stacking_method", "pws"),
+            )
+            _GPU_PATH_LOGGED = True
+        return stacked.detach().cpu().numpy().astype(np.float32, copy=False)
     return np.asarray(
         stack_pairwise_cubes(
             np.asarray(gathers),
@@ -292,6 +353,15 @@ def run_node_ccf(config: NodeCCFConfig) -> Path:
         runtime.requested_backend,
         runtime.requested_device,
     )
+    if runtime.actual_backend == "torch" and runtime.actual_device == "cuda":
+        import torch
+
+        LOG.info(
+            "Torch CUDA device=%d: %s (capability %s); CPU fallback is disabled",
+            torch.cuda.current_device(),
+            torch.cuda.get_device_name(),
+            torch.cuda.get_device_capability(),
+        )
     if str(cc_params.get("cc_device", "auto")) == "cuda" and runtime.actual_device != "cuda":
         raise RuntimeError(
             "CUDA was requested but is unavailable; check the DAS Python environment and NVIDIA driver"
