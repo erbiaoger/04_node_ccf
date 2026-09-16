@@ -1,6 +1,6 @@
 # 节点 SAC 互相关
 
-本目录把排序 CSV 和 `/Volumes/CSIM/2026SaErTuoHai_passive` 这类节点 SAC 数据接入现有 DAS CCF 计算。读取器只映射 SAC 数据区，不把 2 TB 级文件整体载入内存；互相关调用现有 DAS 的 `compute_cc_shot` 核心。
+本目录把排序 CSV 和 `/Volumes/CSIM/2026SaErTuoHai_passive` 这类节点 SAC 数据接入现有 DAS CCF 计算。默认 `read_mode=preload`：先将 CSV 中选定台站的共同时间段一次性读入运行内存，再按一分钟切片并把多个短窗组成 batch，交给现有 DAS 的 `compute_cc_shot` 和 GPU/CPU 后端。`read_mode=window` 可作为低内存回退模式。
 
 本仓库依赖已有 DAS/dasQt 源码仓库和其中的 `.venv`。服务器上默认寻找
 `/csim2/zhangzhiyu/MyProjects/DAS_Procee_Show`，本机默认寻找
@@ -27,6 +27,15 @@ bash examples/04_node_ccf/run_node_ccf.sh /path/to/stations.csv
 
 从独立克隆目录运行时直接执行 `./run_node_ccf.sh` 即可；脚本会自动调用外部
 DAS 仓库的 `_shell_common.sh` 同等环境逻辑，并使用本仓库的配置、CSV 和输出目录。
+
+服务器使用 CUDA 时可显式指定后端和设备：
+
+```bash
+READ_MODE=preload CC_BACKEND=torch CC_DEVICE=cuda CC_BATCH_CHUNKS=8 \
+./run_node_ccf.sh ./config/line_380_stations.csv /path/to/node_sac ./outputs/node_ccf
+```
+
+`CC_BATCH_CHUNKS` 是一次送入后端的短窗数量；一分钟内的短窗会先按该数量分批处理，再完成一分钟叠加。预加载模式会按实际数据长度申请内存，请先确认服务器可用内存足够。
 
 当前配置已经填入第380线的 CSV，因此也可以直接运行整条第380线：
 

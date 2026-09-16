@@ -222,9 +222,11 @@ class NodeSACReader:
                     f"Window outside {station.station_id} at {datetime.fromtimestamp(start_timestamp, UTC).isoformat()}"
                 )
             start_index.append(index)
-        columns = []
+        data = np.empty((npts, len(self.catalog.stations)), dtype=self.dtype)
         valid = np.ones(len(self.catalog.stations), dtype=bool)
-        for station, index in zip(self.catalog.stations, start_index):
+        for station_index, (station, index) in enumerate(
+            zip(self.catalog.stations, start_index)
+        ):
             pieces: list[np.ndarray] = []
             remaining_start, remaining = index, npts
             for segment in station.segments:
@@ -261,8 +263,8 @@ class NodeSACReader:
                 raise ValueError(
                     f"Window crosses a missing SAC segment for {station.station_id}"
                 )
-            columns.append(np.concatenate(pieces))
-        return np.column_stack(columns), valid
+            data[:, station_index] = np.concatenate(pieces)
+        return data, valid
 
     def iter_windows(
         self,

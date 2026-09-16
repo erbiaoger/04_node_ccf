@@ -4,15 +4,17 @@
 Purpose
 -------
 Read a station-order CSV, map each station to its SAC file(s), and reuse the
-DAS CCF implementation.  Short-window correlations are stacked into 60-second
-blocks, then ``save_every`` blocks are stacked and written as MAT files.
+DAS CCF implementation.  By default the common time range is preloaded into
+RAM. Short-window correlations are batched into 60-second blocks, followed by a
+second stack every ``save_every`` blocks, and written as MAT files.
 
 Usage
 -----
 The recommended entrypoint is ``bash examples/04_node_ccf/run_node_ccf.sh``.
 For direct use, pass ``--config`` plus optional ``--csv``, ``--data-dir`` and
 ``--output-dir`` overrides.  Correlation and grouping overrides are available
-through the corresponding ``--cc-len``, ``--step-s``, ``--minute-stack-s``,
+through the corresponding ``--read-mode``, ``--cc-backend``, ``--cc-device``,
+``--cc-batch-chunks``, ``--cc-len``, ``--step-s``, ``--minute-stack-s``,
 ``--save-every`` and time-range options; ``--help`` prints the full list.
 
 Output
@@ -54,11 +56,29 @@ def main() -> None:
     parser.add_argument(
         "--output-dir", type=Path, help="输出目录；也可在配置中设置 node_output_dir"
     )
+    parser.add_argument(
+        "--read-mode",
+        choices=("preload", "window"),
+        help="数据读取模式：preload 一次性读入内存，window 逐窗读取",
+    )
     parser.add_argument("--pair-mode", choices=("all_pairs", "sliding"))
     parser.add_argument("--offset-m", type=float, help="滑动模式接收范围（米）")
     parser.add_argument("--dshot-m", type=float, help="滑动模式震源步长（米）")
     parser.add_argument("--cc-len", type=float, help="互相关短窗长度（秒）")
     parser.add_argument("--step-s", type=float, help="短窗步长（秒）")
+    parser.add_argument(
+        "--cc-backend",
+        choices=("auto", "cpu", "torch", "cupy", "cpp"),
+        help="CC 后端；GPU 可选 torch 或 cupy",
+    )
+    parser.add_argument(
+        "--cc-device",
+        choices=("auto", "cpu", "cuda", "mps"),
+        help="计算设备，例如 cuda",
+    )
+    parser.add_argument(
+        "--cc-batch-chunks", type=int, help="一次送入后端的短窗数量"
+    )
     parser.add_argument(
         "--minute-stack-s", type=float, help="先将多少秒短窗叠加为一个分钟段"
     )
@@ -72,6 +92,12 @@ def main() -> None:
     params = load_config_json(base_config) if base_config.exists() else {}
     if config_path.exists():
         params.update(load_config_json(config_path))
+    if args.cc_backend:
+        params["cc_backend"] = args.cc_backend
+    if args.cc_device:
+        params["cc_device"] = args.cc_device
+    if args.cc_batch_chunks is not None:
+        params["cc_batch_chunks"] = args.cc_batch_chunks
     run_node_ccf(
         NodeCCFConfig(
             csv_path=args.csv or Path(params.get("station_csv", "stations.csv")),
@@ -83,6 +109,7 @@ def main() -> None:
             or Path(
                 params.get("node_output_dir", "examples/04_node_ccf/outputs/node_ccf")
             ),
+            read_mode=args.read_mode or params.get("read_mode", "preload"),
             pair_mode=args.pair_mode or params.get("pair_mode", "all_pairs"),
             cc_len=args.cc_len or float(params.get("cc_len", 5.0)),
             step_s=args.step_s

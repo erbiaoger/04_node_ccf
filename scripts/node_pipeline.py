@@ -1,10 +1,11 @@
 """Two-level node SAC CCF pipeline.
 
 The reader supplies CSV-ordered node traces while the correlation and stacking
-kernels are reused from the DAS implementation.  Each short correlation window
-is first stacked into a ``minute_stack_s`` block (60 s by default).  Consecutive
-minute blocks are then stacked in groups of ``save_every`` (30 by default) and
-written as DAS-compatible ``.mat`` files.
+kernels are reused from the DAS implementation.  In the default ``preload``
+mode, the common time range is loaded once into RAM, then short windows within
+each ``minute_stack_s`` block (60 s by default) are batched for the configured
+backend.  Consecutive minute blocks are then stacked in groups of ``save_every``
+(30 by default) and written as DAS-compatible ``.mat`` files.
 
 The output ``data`` array has shape ``(source, lag, receiver)``.  For
 ``pair_mode=all_pairs`` only the upper-triangle pairs are computed; the lower
@@ -45,6 +46,7 @@ class NodeCCFConfig:
     csv_path: Path
     data_dir: Path
     output_dir: Path
+    read_mode: str = "preload"
     pair_mode: str = "all_pairs"
     cc_len: float = 5.0
     step_s: float = 5.0
@@ -131,6 +133,11 @@ def run_node_ccf(config: NodeCCFConfig) -> Path:
         raise ValueError("minute_stack_s must be positive")
     if config.save_every <= 0:
         raise ValueError("save_every must be a positive number of minutes")
+    if config.cc_len <= 0 or config.step_s <= 0:
+        raise ValueError("cc_len and step_s must be positive")
+    read_mode = str(config.read_mode).strip().lower()
+    if read_mode not in {"preload", "window"}:
+        raise ValueError("read_mode must be preload or window")
     source, receiver, _ = _pair_indices(catalog, config)
     if config.pair_mode != "all_pairs":
         raise ValueError("MAT output currently supports pair_mode=all_pairs only")
@@ -212,6 +219,9 @@ def run_node_ccf(config: NodeCCFConfig) -> Path:
                 "save_every": config.save_every,
                 "cc_len": config.cc_len,
                 "step_s": config.step_s,
+                "read_mode": config.read_mode,
+                "cc_backend": str(cc_params.get("cc_backend", "auto")),
+                "cc_device": str(cc_params.get("cc_device", "auto")),
                 "pair_mode": config.pair_mode,
             },
         )
@@ -222,38 +232,99 @@ def run_node_ccf(config: NodeCCFConfig) -> Path:
             short_count,
         )
 
-    for window_start, (data, _) in reader.iter_windows(
-        start, end, config.cc_len, config.step_s
-    ):
+    def append_minute(
+        minute_start_time: float,
+        minute_gather: np.ndarray,
+        short_count: int,
+        end_time: float,
+    ) -> None:
+        nonlocal group_block, group_start, group_short_count
+        group_block.append(minute_gather)
+        group_short_count += short_count
+        if group_start is None:
+            group_start = minute_start_time
+        if len(group_block) >= config.save_every:
+            save_group(group_block, group_start, end_time, group_short_count)
+            group_block, group_start, group_short_count = [], None, 0
+
+    if read_mode == "preload":
+        # Read the complete common interval once.  The following minute loops
+        # only slice this in-memory array, so SAC I/O is not repeated.
+        full_data, _ = reader.read_window(start, end - start)
+        LOG.info(
+            "preloaded %.3f GiB (%d samples x %d stations) into RAM",
+            full_data.nbytes / 1024**3,
+            full_data.shape[0],
+            full_data.shape[1],
+        )
         if time_downsample > 1:
-            data = resample_poly(data, 1, time_downsample, axis=0).astype(
-                config.dtype, copy=False
-            )
+            full_data = resample_poly(
+                full_data, 1, time_downsample, axis=0
+            ).astype(config.dtype, copy=False)
             meta["dt"] = time_downsample / reader.fs
         else:
             meta["dt"] = 1.0 / reader.fs
         meta["profileX"] = catalog.distances_m
-        if (
-            minute_start is not None
-            and window_start >= minute_start + config.minute_stack_s
+        effective_fs = 1.0 / meta["dt"]
+        window_npts = round(config.cc_len * effective_fs)
+        cursor = start
+        while cursor + config.cc_len <= end + 1e-6:
+            block_end = min(cursor + config.minute_stack_s, end)
+            window_starts: list[float] = []
+            window_cursor = cursor
+            while (
+                window_cursor < block_end - 1e-6
+                and window_cursor + config.cc_len <= end + 1e-6
+            ):
+                window_starts.append(window_cursor)
+                window_cursor += config.step_s
+            if window_starts:
+                pieces = []
+                for window_start in window_starts:
+                    start_index = round((window_start - start) * effective_fs)
+                    pieces.append(
+                        full_data[start_index : start_index + window_npts, :]
+                    )
+                # Concatenating independent windows lets the established DAS
+                # kernel batch them without changing the configured step/overlap.
+                minute_data = np.concatenate(pieces, axis=0)
+                minute_gather = _compute_dense_gather(
+                    minute_data, meta, cc_params
+                )
+                append_minute(cursor, minute_gather, len(window_starts), block_end)
+            cursor = block_end
+    else:
+        # Low-memory compatibility path: read one short window at a time.
+        for window_start, (data, _) in reader.iter_windows(
+            start, end, config.cc_len, config.step_s
         ):
-            minute_gather = _stack_gathers(minute_block, meta["dt"], cc_params)
-            group_block.append(minute_gather)
-            group_short_count += len(minute_block)
-            if group_start is None:
-                group_start = minute_start
-            minute_block, minute_start = [], None
-            if len(group_block) >= config.save_every:
-                save_group(group_block, group_start, window_start, group_short_count)
-                group_block, group_start, group_short_count = [], None, 0
-        minute_block.append(_compute_dense_gather(data, meta, cc_params))
-        if minute_start is None:
-            minute_start = window_start
+            if time_downsample > 1:
+                data = resample_poly(data, 1, time_downsample, axis=0).astype(
+                    config.dtype, copy=False
+                )
+                meta["dt"] = time_downsample / reader.fs
+            else:
+                meta["dt"] = 1.0 / reader.fs
+            meta["profileX"] = catalog.distances_m
+            if (
+                minute_start is not None
+                and window_start >= minute_start + config.minute_stack_s
+            ):
+                minute_gather = _stack_gathers(minute_block, meta["dt"], cc_params)
+                append_minute(
+                    minute_start, minute_gather, len(minute_block), window_start
+                )
+                minute_block, minute_start = [], None
+            minute_block.append(_compute_dense_gather(data, meta, cc_params))
+            if minute_start is None:
+                minute_start = window_start
     if minute_block:
-        group_block.append(_stack_gathers(minute_block, meta["dt"], cc_params))
-        group_short_count += len(minute_block)
-        if group_start is None:
-            group_start = minute_start
+        append_minute(
+            minute_start,
+            _stack_gathers(minute_block, meta["dt"], cc_params),
+            len(minute_block),
+            end,
+        )
     if group_block:
         save_group(group_block, group_start, end, group_short_count)
     if file_index == 0:

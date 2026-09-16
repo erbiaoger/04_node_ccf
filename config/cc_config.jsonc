@@ -6,6 +6,8 @@
     "station_csv": "examples/04_node_ccf/config/line_380_stations.csv",
     "node_data_dir": "/Volumes/CSIM/2026SaErTuoHai_passive",
     "node_output_dir": "examples/04_node_ccf/outputs/node_ccf",
+    // preload：完整共同时间段一次性载入内存；window：逐个短窗读取。
+    "read_mode": "preload",
     "pair_mode": "all_pairs",
     // 每多少分钟保存一个 MAT 结果；末尾不足一个时间段也单独保存。
     "save_every": 30,
@@ -29,8 +31,9 @@
     "cc_dtype": "float32",
 
     // ---------- 数值后端 ----------
-    "cc_backend": "torch",
-    "cc_device": "mps",
+    // auto + cuda：服务器优先使用 CUDA；没有 CUDA 时按 DAS 逻辑回退 CPU。
+    "cc_backend": "auto",
+    "cc_device": "cuda",
     "cc_threads": 0,
     "cc_batch_chunks": 8,
     "cc_shot_batch_size": 16,
