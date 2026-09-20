@@ -23,6 +23,7 @@ Options:
   --cc-device NAME        auto | cpu | mps | cuda；默认：cuda
   --cc-dtype NAME         float32 | float64；默认：float32
   --plot-name NAME        汇总图名；默认：node_cc_preview.png
+  --cmap NAME             reference/turbo/RdYlBu_r/Spectral_r/coolwarm/mycmap
   --no-save-shot-figures  不保存逐源节点图片，只保存汇总图
   --help                  显示帮助信息
 EOF
@@ -39,6 +40,7 @@ CC_BACKEND="torch"
 CC_DEVICE="cuda"
 CC_DTYPE="float32"
 PLOT_NAME="node_cc_preview.png"
+CMAP="RdYlBu_r"
 SAVE_SHOT_FIGURES="1"
 
 _node_abs_path() {
@@ -61,6 +63,7 @@ while [[ $# -gt 0 ]]; do
     --cc-device) CC_DEVICE="$2"; shift 2 ;;
     --cc-dtype) CC_DTYPE="$2"; shift 2 ;;
     --plot-name) PLOT_NAME="$2"; shift 2 ;;
+    --cmap) CMAP="$2"; shift 2 ;;
     --no-save-shot-figures) SAVE_SHOT_FIGURES="0"; shift ;;
     --help|-h) usage; exit 0 ;;
     *) echo "错误：未知参数：$1" >&2; usage; exit 1 ;;
@@ -93,6 +96,7 @@ PLOT_ARGS=(
   --input-dir "${OUTPUT_DIR}"
   --profile-source-dir "${INPUT_DIR}"
   --plot-name "${PLOT_NAME}"
+  --cmap "${CMAP}"
 )
 [[ "${SAVE_SHOT_FIGURES}" == "0" ]] && PLOT_ARGS+=(--no-save-shot-figures)
 run_uv_python "${PLOT_ARGS[@]}"

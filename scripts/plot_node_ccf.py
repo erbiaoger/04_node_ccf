@@ -34,8 +34,14 @@ import matplotlib.pyplot as plt
 import numpy as np
 from scipy.io import loadmat
 
-plt.rcParams["font.family"] = "Times New Roman"
-plt.rcParams["font.sans-serif"] = ["Times New Roman"]
+from dasqt.utils.imshow import (
+    configure_publication_style,
+    figure_size,
+    get_colormap,
+    style_axis,
+)
+
+configure_publication_style()
 
 LOG = logging.getLogger(__name__)
 
@@ -89,6 +95,7 @@ def _plot_matrix(
     output: Path,
     *,
     title: str,
+    cmap: str,
 ) -> None:
     matrix = np.asarray(matrix, dtype=float)
     nt, _ = matrix.shape
@@ -96,12 +103,12 @@ def _plot_matrix(
     vmax = float(np.percentile(np.abs(matrix), 99)) if matrix.size else 1.0
     if not np.isfinite(vmax) or vmax == 0:
         vmax = 1.0
-    fig, ax = plt.subplots(figsize=(9, 4))
+    fig, ax = plt.subplots(figsize=figure_size("double", aspect=0.45))
     image = ax.pcolormesh(
         _centers_to_edges(profile_x),
         _centers_to_edges(t),
         matrix,
-        cmap="RdBu_r",
+        cmap=get_colormap(cmap),
         shading="auto",
         vmin=-vmax,
         vmax=vmax,
@@ -110,10 +117,11 @@ def _plot_matrix(
     ax.set_title(title)
     ax.set_xlabel("Distance (m)")
     ax.set_ylabel("Time lag (s)")
+    style_axis(ax)
     fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
     fig.tight_layout()
     output.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output, bbox_inches="tight", dpi=150)
+    fig.savefig(output, bbox_inches="tight", dpi=600)
     plt.close(fig)
 
 
@@ -133,6 +141,7 @@ def plot_node_results(
     plot_name: str,
     save_shot_figures: bool,
     source_dir: Path | None,
+    cmap: str = "RdYlBu_r",
 ) -> None:
     files = sorted(path for path in input_dir.glob("restack_*.mat") if path.is_file())
     if not files:
@@ -153,6 +162,7 @@ def plot_node_results(
                     profile_x,
                     shots_dir / f"{path.stem}_shot_{source_index:04d}.png",
                     title=f"{path.stem} | source {source_index}",
+                    cmap=cmap,
                 )
             _plot_matrix(
                 np.mean(data, axis=0),
@@ -160,6 +170,7 @@ def plot_node_results(
                 profile_x,
                 shots_dir / f"{path.stem}_merged_by_position.png",
                 title=f"{path.stem} | mean over source positions",
+                cmap=cmap,
             )
             LOG.info("saved source figures: %s", shots_dir)
 
@@ -168,7 +179,7 @@ def plot_node_results(
     fig, axes = plt.subplots(
         nrows,
         ncols,
-        figsize=(6.5 * ncols, 4.2 * nrows),
+        figsize=figure_size("double", aspect=max(0.55, 0.55 * nrows)),
         squeeze=False,
     )
     for index, (path, data, dt, profile_x) in enumerate(items):
@@ -182,7 +193,7 @@ def plot_node_results(
             _centers_to_edges(profile_x),
             _centers_to_edges(t),
             matrix,
-            cmap="RdBu_r",
+            cmap=get_colormap(cmap),
             shading="auto",
             vmin=-vmax,
             vmax=vmax,
@@ -190,12 +201,13 @@ def plot_node_results(
         ax.set_title(f"{path.stem} | source 0")
         ax.set_xlabel("Distance (m)")
         ax.set_ylabel("Time lag (s)")
+        style_axis(ax)
         fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
     for ax in axes.flat[len(items) :]:
         ax.axis("off")
     fig.tight_layout()
     output = input_dir / plot_name
-    fig.savefig(output, bbox_inches="tight", dpi=150)
+    fig.savefig(output, bbox_inches="tight", dpi=600)
     plt.close(fig)
     LOG.info("saved summary plot: %s", output)
 
@@ -216,6 +228,11 @@ def main() -> None:
         "--plot-name", default="node_cc_preview.png", help="汇总图文件名。"
     )
     parser.add_argument(
+        "--cmap",
+        default="RdYlBu_r",
+        help="reference/turbo/RdYlBu_r/Spectral_r/coolwarm/mycmap",
+    )
+    parser.add_argument(
         "--no-save-shot-figures",
         action="store_true",
         help="只生成汇总图，不保存每个源节点图。",
@@ -233,7 +250,11 @@ def main() -> None:
         else None
     )
     plot_node_results(
-        input_dir, args.plot_name, not args.no_save_shot_figures, source_dir
+        input_dir,
+        args.plot_name,
+        not args.no_save_shot_figures,
+        source_dir,
+        cmap=args.cmap,
     )
 
 

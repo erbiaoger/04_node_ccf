@@ -8,3 +8,7 @@
 
 通常直接运行上级目录的 `run_node_ccf.sh`，不需要手动调用这些文件。
 后处理由上级目录的 `run_node_ccf_stack.sh` 调用本目录的 `stack_node_cc_mat.py` 完成二次叠加，再调用坐标感知绘图脚本；叠加内核仍复用 DAS 的 `stack_cc_chunks`。
+
+绘图统一使用 Times New Roman、出版级四边刻度、180 mm 双栏尺寸和 600 dpi。
+`run_node_ccf_stack.sh --cmap NAME` 可选择 `reference`、`turbo`、
+`RdYlBu_r`、`Spectral_r`、`coolwarm` 或 `mycmap`。
