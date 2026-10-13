@@ -1,195 +1,205 @@
 #!/usr/bin/env python3
-"""Second-level stack for node CCF MAT files.
+"""节点 CCF 成品的流式二次叠加，逐对 PWS，默认 C++/CUDA。
 
-This is the standalone-node counterpart of DAS ``stack_saved_cc_mat.py``. It
-uses the shared DAS ``stack_cc_chunks`` backend, preserves ``profileX`` and
-writes ``restack_*.mat``. Plotting is intentionally handled by
-``plot_node_ccf.py`` so irregular node coordinates are drawn correctly.
-
-Example
--------
-    uv run python scripts/stack_node_cc_mat.py \
-      --input-dir ./outputs/node_ccf \
-      --output-dir ./outputs/node_ccf_restack \
-      --glob 'cc_stack_*.mat' --stack-size None \
-      --stack-method pws --cc-backend torch --cc-device cuda
+用途：顺序读取新的 cc_stack MAT，只保留一个输入文件和GPU逐对统计量，
+按有效文件等权叠加。有效计数作质量元数据，不用于改变文件权重。
+运行：bash examples/04_node_ccf/run_node_ccf_stack.sh
+直接运行：项目 .venv 中 uv run --no-sync python
+examples/04_node_ccf/scripts/stack_node_cc_mat.py --input-dir outputs/node_ccf
+--output-dir outputs/node_ccf_restack --cc-backend cpp_cuda --cc-device cuda
+输出：restack_XXXX_nN_idxXXXX-XXXX.mat，保留台站、坐标、有效掩码和输入来源。
+参数详见 --help 与下方 argparse help；终端输出输入数量、后端和保存进度。
+旧DAS展平PWS MAT不能混入新节点结果，计算版本或台站顺序不一致会报错。
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 from pathlib import Path
-from typing import Any
 
 import numpy as np
-from dasqt.features.dispersion.backend.components.ccf import stack_cc_chunks
-from scipy.io import loadmat, savemat
+from node_compute.backend import create_session
+from node_compute.parameters import VERSION, validate
+from node_output.artifacts import dense_pairs, digest, save_mat
+from scipy.io import loadmat
 
 LOG = logging.getLogger(__name__)
 
 
-def _optional_int(value: str) -> int | None:
-    text = str(value).strip().lower()
-    if text in {"", "none", "null"}:
-        return None
-    result = int(text)
-    if result <= 0:
-        raise ValueError("stack-size/interval must be positive or None")
-    return result
+def scalar(mat, key):
+    return np.asarray(mat[key]).reshape(-1)[0].item()
 
 
-def _scalar(mat: dict[str, Any], key: str, default: float) -> float:
-    if key not in mat:
-        return float(default)
-    value = np.asarray(mat[key]).squeeze()
-    return float(value.reshape(-1)[0]) if value.size else float(default)
-
-
-def load_mat(path: Path) -> tuple[np.ndarray, float, float, float | None, np.ndarray]:
-    mat = loadmat(path)
-    if "data" not in mat or "dt" not in mat or "dx" not in mat:
-        raise ValueError(f"{path.name} must contain data, dt and dx")
-    data = np.asarray(mat["data"], dtype=np.float32).squeeze()
-    if data.ndim == 2:
-        data = data[None, :, :]
-    if data.ndim != 3:
-        raise ValueError(f"{path.name} data must be 2D/3D, got {data.shape}")
-    dt = _scalar(mat, "dt", 1.0)
-    dx = _scalar(mat, "dx", 1.0)
-    dshot = _scalar(mat, "dshot", dx) if "dshot" in mat else None
-    profile = np.asarray(mat.get("profileX", []), dtype=float).squeeze()
-    if profile.ndim != 1 or profile.size != data.shape[-1]:
-        profile = np.arange(data.shape[-1], dtype=float) * dx
-    return data, dt, dx, dshot, profile
-
-
-def build_windows(
-    files: list[Path], stack_size: int | None, interval: int | None
-) -> list[tuple[int, int, list[Path]]]:
+def build_windows(files, stack_size, interval):
     size = len(files) if stack_size is None else stack_size
-    if size <= 0 or len(files) < size:
-        raise ValueError(f"Not enough files for stack-size={size}: found {len(files)}")
-    if interval is None:
-        return [(0, size - 1, files[:size])]
-    windows = []
-    start = 0
-    while start + size <= len(files):
-        end = start + size - 1
-        windows.append((start, end, files[start : end + 1]))
-        start += interval
-    return windows
+    if size < 1 or len(files) < size or (interval is not None and interval < 1):
+        raise ValueError("Invalid stack-size/interval or not enough files")
+    step = size if interval is None else interval
+    starts = [0] if interval is None else range(0, len(files) - size + 1, step)
+    return [(start, start + size - 1, files[start : start + size]) for start in starts]
 
 
 def stack_window(
-    files: list[Path],
+    files,
     *,
-    stack_method: str,
-    cc_backend: str,
-    cc_device: str,
-    cc_dtype: str,
-) -> tuple[np.ndarray, float, float, float | None, np.ndarray]:
-    loaded = [load_mat(path) for path in files]
-    reference = loaded[0]
-    data = np.stack([item[0] for item in loaded], axis=0)
-    if any(item[0].shape != reference[0].shape for item in loaded[1:]):
-        raise ValueError("MAT files in one stack window have different data shapes")
-    if any(not np.isclose(item[1], reference[1]) for item in loaded[1:]):
-        raise ValueError("MAT files in one stack window have different dt")
-    if any(not np.isclose(item[2], reference[2]) for item in loaded[1:]):
-        raise ValueError("MAT files in one stack window have different dx")
-    if stack_method == "mean":
-        stacked = np.mean(data, axis=0)
-    else:
-        # DAS stack_cc_chunks stacks its second axis. Move source shots there
-        # so each source is stacked independently across input MAT files.
-        chunks = np.transpose(data, (1, 0, 2, 3))
-        stacked = stack_cc_chunks(
-            chunks,
-            dt=reference[1],
-            smethod=stack_method,
-            params={
-                "cc_backend": cc_backend,
-                "cc_device": cc_device,
-                "cc_dtype": cc_dtype,
-            },
+    stack_method="pws",
+    cc_backend="cpp_cuda",
+    cc_device="cuda",
+    cc_dtype="float32",
+):
+    reference = None
+    session = None
+    short_count = minute_count = None
+    fingerprints = []
+    for path in files:
+        mat = loadmat(path)
+        if str(scalar(mat, "computation_version")) != VERSION:
+            raise ValueError(
+                f"{path}: wrong node computation version; recalculate with the new spectral pair pipeline"
+            )
+        data = np.asarray(mat["data"], dtype=np.float32)
+        if data.ndim != 3 or data.shape[0] != data.shape[2]:
+            raise ValueError(f"{path}: expected source×lag×receiver cube")
+        stations = data.shape[0]
+        source, receiver = np.triu_indices(stations, 1)
+        valid = np.asarray(mat["valid_mask"], dtype=bool)
+        if valid.shape != (stations, stations) or not np.isfinite(data).all():
+            raise ValueError(f"{path}: invalid mask or nonfinite CCF")
+        if reference is None:
+            reference = mat
+            params = json.loads(str(scalar(mat, "parameters_json")))
+            params.update(
+                cc_backend=cc_backend,
+                cc_device=cc_device,
+                cc_dtype=cc_dtype,
+                stacking_method=stack_method,
+            )
+            params = validate(params, float(scalar(mat, "raw_sampling_rate")))
+            session = create_session(params, stations)
+            short_count = np.zeros((stations, stations), dtype=np.uint64)
+            minute_count = np.zeros_like(short_count)
+        else:
+            for key in (
+                "station_id",
+                "profileX",
+                "lags_s",
+                "dt",
+                "task_id",
+            ):
+                if not np.array_equal(mat[key], reference[key]):
+                    raise ValueError(f"{path}: incompatible {key}")
+        session.stack_pairs(data[source, :, receiver], valid[source, receiver])
+        short_count += np.asarray(mat["valid_short_window_count"], dtype=np.uint64)
+        minute_count += np.asarray(mat["valid_minute_count"], dtype=np.uint64)
+        fingerprints.append(digest(path))
+        LOG.info("Restack added %s", path.name)
+    if session is None:
+        raise ValueError("No MAT files to stack")
+    result = session.finish_group()
+    fields = {
+        key: reference[key]
+        for key in (
+            "dt",
+            "dx",
+            "dshot",
+            "profileX",
+            "station_id",
+            "lags_s",
+            "pair_source_index",
+            "pair_receiver_index",
+            "pair_index_base",
+            "computation_version",
+            "correlation_definition",
+            "pws_axis",
+            "pws_power",
+            "weighting",
+            "raw_sampling_rate",
+            "time_downsample",
+            "task_id",
         )
-    return (
-        np.asarray(stacked, dtype=np.float32),
-        reference[1],
-        reference[2],
-        reference[3],
-        reference[4],
+    }
+    fields.update(
+        data=dense_pairs(result["pairs"], stations),
+        valid_mask=dense_pairs(result["valid_count"] > 0, stations, mirror_lag=False),
+        valid_file_count=dense_pairs(result["valid_count"], stations, mirror_lag=False),
+        valid_short_window_count=short_count,
+        valid_minute_count=minute_count,
+        source_files=np.asarray([p.name for p in files], dtype=object),
+        source_file_sha256=np.asarray(fingerprints, dtype=object),
+        source_start_unix=scalar(reference, "source_start_unix"),
+        source_end_unix=scalar(mat, "source_end_unix"),
+        cc_backend=cc_backend,
+        cc_device=cc_device,
+        parameters_json=json.dumps(params, sort_keys=True),
+        diagnostics_json=json.dumps(session.diagnostics(), sort_keys=True),
     )
+    return fields
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="节点 CCF MAT 二次叠加。")
-    parser.add_argument("--input-dir", type=Path, required=True)
-    parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--glob", default="cc_stack_*.mat")
-    parser.add_argument("--stack-size", default="None")
-    parser.add_argument("--interval", default="None")
-    parser.add_argument("--start-index", type=int, default=0)
+def optional_int(value):
+    return None if str(value).lower() == "none" else int(value)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="节点逐对流式二次叠加；有效文件等权")
+    parser.add_argument("--input-dir", type=Path, required=True, help="30分钟MAT目录")
     parser.add_argument(
-        "--stack-method", choices=("pws", "robust", "linear", "mean"), default="pws"
+        "--output-dir", type=Path, required=True, help="总叠加MAT输出目录"
+    )
+    parser.add_argument("--glob", default="cc_stack_*.mat", help="输入文件匹配模式")
+    parser.add_argument(
+        "--stack-size", default="None", help="每组输入文件数量；None=全部"
+    )
+    parser.add_argument("--interval", default="None", help="文件组滑动步长；None=一组")
+    parser.add_argument(
+        "--start-index", type=int, default=0, help="按文件名排序后的起始文件索引"
     )
     parser.add_argument(
-        "--cc-backend", choices=("auto", "cpu", "torch"), default="torch"
+        "--stack-method",
+        choices=("linear", "pws"),
+        default="pws",
+        help="逐对叠加，PWS指数2",
     )
     parser.add_argument(
-        "--cc-device", choices=("auto", "cpu", "mps", "cuda"), default="cuda"
+        "--cc-backend",
+        choices=("cpp_cuda", "cpu", "torch"),
+        default="cpp_cuda",
+        help="显式后端，无自动回退",
     )
-    parser.add_argument("--cc-dtype", choices=("float32", "float64"), default="float32")
+    parser.add_argument(
+        "--cc-device", choices=("cpu", "cuda"), default="cuda", help="计算设备"
+    )
+    parser.add_argument(
+        "--cc-dtype", choices=("float32",), default="float32", help="节点存储精度"
+    )
     args = parser.parse_args()
     logging.basicConfig(
         level=logging.INFO, format="[%(asctime)s] %(levelname)s %(message)s"
     )
-    input_dir = args.input_dir.expanduser().resolve()
-    output_dir = args.output_dir.expanduser().resolve()
-    files = sorted(path for path in input_dir.glob(args.glob) if path.is_file())
-    if not files:
-        raise FileNotFoundError(f"No files matched: {input_dir}/{args.glob}")
+    files = sorted(args.input_dir.glob(args.glob))
     if args.start_index < 0 or args.start_index >= len(files):
-        raise ValueError("start-index is outside the input MAT list")
-    selected = files[args.start_index :]
+        raise ValueError("No input files or start-index outside input list")
     windows = build_windows(
-        selected, _optional_int(args.stack_size), _optional_int(args.interval)
+        files[args.start_index :],
+        optional_int(args.stack_size),
+        optional_int(args.interval),
     )
-    LOG.info("input=%s files=%d windows=%d", input_dir, len(selected), len(windows))
-    LOG.info(
-        "stack method=%s backend=%s device=%s",
-        args.stack_method,
-        args.cc_backend,
-        args.cc_device,
-    )
-    output_dir.mkdir(parents=True, exist_ok=True)
-    for index, (start, end, window_files) in enumerate(windows, start=1):
-        data, dt, dx, dshot, profile = stack_window(
-            window_files,
+    for index, (start, end, window) in enumerate(windows, 1):
+        fields = stack_window(
+            window,
             stack_method=args.stack_method,
             cc_backend=args.cc_backend,
             cc_device=args.cc_device,
             cc_dtype=args.cc_dtype,
         )
         output = (
-            output_dir
-            / f"restack_{index:04d}_n{len(window_files)}_idx{start:04d}-{end:04d}.mat"
+            args.output_dir
+            / f"restack_{index:04d}_n{len(window)}_idx{start:04d}-{end:04d}.mat"
         )
-        savemat(
-            output,
-            {
-                "data": data,
-                "dt": dt,
-                "dx": dx,
-                "dshot": dx if dshot is None else dshot,
-                "profileX": profile,
-                "source_files": np.asarray(
-                    [path.name for path in window_files], dtype=object
-                ),
-            },
-        )
-        LOG.info("saved %s", output.name)
+        save_mat(output, fields)
+        LOG.info("Saved %s", output)
 
 
 if __name__ == "__main__":

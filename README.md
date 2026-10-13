@@ -1,88 +1,122 @@
-# 节点 SAC 互相关
+# 第380线节点全配对互相关：C++/CUDA
 
-本目录把排序 CSV 和 `/Volumes/CSIM/2026SaErTuoHai_passive` 这类节点 SAC 数据接入现有 DAS CCF 计算。默认 `read_mode=preload`：先将 CSV 中选定台站的共同时间段一次性读入运行内存，再按一分钟切片并把多个短窗组成 batch，交给现有 DAS 的 `compute_cc_shot` 和 GPU/CPU 后端。`read_mode=window` 可作为低内存回退模式。
+默认34节点、561个无序节点对；CSV顺序保持不变。A–B只计算一次，B–A由延迟
+反转得到，对角线不计算。节点流程已经移除sliding、offset和dshot计算模式。
 
-本仓库依赖已有 DAS/dasQt 源码仓库和其中的 `.venv`。服务器上默认寻找
-`/csim2/zhangzhiyu/MyProjects/DAS_Procee_Show`，本机默认寻找
-`/Users/zhangzhiyu/MyProjects/dasQt`；也可以显式指定：
+## 计算定义
 
-```bash
-DASQT_REPO_DIR=/path/to/DAS_Procee_Show ./run_node_ccf.sh
-```
+10秒窗/5秒步长，2–30Hz，±4秒延迟，时域RMA+频域RMA。
+去趋势/加窗/带通/时间归一化后，补零到至少2N−1并FFT，在该频谱上白化，
+**直接 `conj(F_A)*F_B` 后逆FFT**。白化后不还原短窗、不再次FFT。
 
-CSV 最少包含两列：
+每个节点对独立沿延迟轴做PWS（指数2），短窗→1分钟→每30分钟保存→全时段
+总叠加。每层有效输入等权，峰值归一化并去均值；有效计数只作质量记录。
 
-```csv
-station_id,distance_m
-450400001,0.0
-450400002,2.5
-```
+预处理与带通复用现有CUDA核；短窗和配对分块、共享频谱、分钟与组统计量
+保留在GPU，只有30分钟成品下载。坏窗只使涉及该节点的配对无效。
+详细公式、边界和旧结果差异见 [方法说明](METHODS.md)。
 
-运行示例：
+## 文件与目录
 
-```bash
-cd /Users/zhangzhiyu/MyProjects/dasQt
-bash examples/04_node_ccf/run_node_ccf.sh /path/to/stations.csv
-```
+- `config/`：独立JSONC配置和第380线CSV，不继承DAS几何/FK/TSI。
+- `scripts/node_io/`：SAC头、参考时间+b、采样网格、memmap读取和缺测掩码。
+- `scripts/node_compute/`：参数、整数窗口调度、严格CUDA边界、CPU/Torch参考。
+- `scripts/node_output/`：原子MAT/JSON、配对稠密化、输入指纹和续算校验。
+- `scripts/cli.py`、`node_pipeline.py`：命令行和两级时间调度。
+- `scripts/stack_node_cc_mat.py`：逐文件流式总叠加，保留几何和有效计数。
+- `scripts/plot_node_ccf.py`：真实profileX坐标绘图，无效配对留空，Times New Roman。
+- `scripts/benchmark_node_pairs.py`：包含传输的原生CUDA/Torch数值及计时对照。
+- `outputs/`：运行生成的MAT、任务清单、图和性能记录，不提交版本管理。
 
-从独立克隆目录运行时直接执行 `./run_node_ccf.sh` 即可；脚本会自动调用外部
-DAS 仓库的 `_shell_common.sh` 同等环境逻辑，并使用本仓库的配置、CSV 和输出目录。
+## 环境与编译
 
-服务器使用 CUDA 时可显式指定后端和设备：
+脚本复用dasQt项目 `.venv`，激活后通过 `uv run --no-sync` 运行。若示例独立
+克隆，指定 `DASQT_REPO_DIR=/csim2/zhangzhiyu/MyProjects/DAS_Procee_Show`。
+默认后端 `cpp_cuda/cuda/float32`，要求RTX4090/sm_89、CUDA Toolkit12.6和
+新编译的 `node_pairwise_version=node_spectral_pair_pws_v1` 扩展，不自动回退。
 
-```bash
-READ_MODE=preload CC_BACKEND=torch CC_DEVICE=cuda CC_BATCH_CHUNKS=8 \
-./run_node_ccf.sh ./config/line_380_stations.csv /path/to/node_sac ./outputs/node_ccf
-```
-
-`CC_BATCH_CHUNKS` 是一次送入后端的短窗数量；一分钟内的短窗会先按该数量分批处理，再完成一分钟叠加。预加载模式会按实际数据长度申请内存，请先确认服务器可用内存足够。
-
-当 `CC_BACKEND=torch` 且 `CC_DEVICE=cuda` 时，短窗预处理、互相关 FFT、分钟叠加和 `save_every` 汇总都会在同一块 CUDA 设备上执行；日志会打印 `Torch CUDA device=...`、`GPU pairwise correlation active` 和 `GPU pairwise stacking active`。CUDA 模式遇到设备不可用或预处理无效数据时会直接报错，不会静默改用 CPU。`nvidia-smi` 的利用率是采样瞬时值，单分钟只有十几个短窗时可能显示较低，但上述日志可以确认实际执行路径。
-
-当前配置已经填入第380线的 CSV，因此也可以直接运行整条第380线：
+可在主项目根目录安装更新后的扩展：
 
 ```bash
-bash examples/04_node_ccf/run_node_ccf.sh
+source .venv/bin/activate
+CUDACXX=/usr/local/cuda-12.6/bin/nvcc uv pip install --python .venv/bin/python \
+  --reinstall --no-deps \
+  --config-settings=cmake.define.CMAKE_CUDA_COMPILER=/usr/local/cuda-12.6/bin/nvcc \
+  --config-settings=cmake.define.CUDAToolkit_ROOT=/usr/local/cuda-12.6 \
+  ./native/cc_cuda_engine
 ```
 
-先做时间段试算时可设置：
+也可先构建独立wheel验证，不替换已有扩展：
+
+```bash
+bash examples/04_node_ccf/run_node_ccf_gpu_checks.sh
+```
+
+该入口生成 `outputs/node_cuda_validation/extension`；使用它运行时设置：
+`PYTHONPATH="$PWD/outputs/node_cuda_validation/extension:$PWD"`。
+
+## 运行
+
+先确认NAS挂载，再做头信息预检：
+
+```bash
+PREFLIGHT=1 bash examples/04_node_ccf/run_node_ccf.sh
+```
+
+一小时试算，保存结果、总叠加和全部节点图：
 
 ```bash
 START_UTC=2026-07-09T11:00:00Z END_UTC=2026-07-09T12:00:00Z \
-bash examples/04_node_ccf/run_node_ccf.sh
+bash examples/04_node_ccf/run_node_ccf_all.sh \
+  examples/04_node_ccf/config/line_380_stations.csv \
+  /mnt/nas-changbai/2026SaErTuoHai_passive \
+  examples/04_node_ccf/outputs/validation_1h
 ```
 
-脚本默认读取本目录的 `config/cc_config.jsonc`，并自动继承 `examples/03_ccf/config/cc_config.jsonc` 的 DAS 参数。频带、短窗、归一化、后端、数据类型和 `time_downsample` 等设置都会传给节点流程。配置中的相对路径以 `04_node_ccf` 仓库根目录为基准，因此下面的配置可直接使用：
-
-```jsonc
-"station_csv": "./config/line_380_stations.csv",
-"node_data_dir": "/mnt/nas-changbai/2026SaErTuoHai_passive",
-"node_output_dir": "./outputs/node_ccf"
-```
-
-绝对路径按原样使用；一键脚本中显式传入的 CSV、数据目录和输出目录会覆盖配置值。需要换配置时设置 `CONFIG=/path/to/cc_config.jsonc`；只有设置 `PAIR_MODE`、`CC_LEN` 等环境变量时才覆盖对应配置值。脚本会在切换到外部 DAS 仓库前把这些显式参数转换为绝对路径。
-
-也可以只传 CSV，让脚本自动使用默认 DAS 配置和节点目录；或显式指定配置：
+正式共同时间段运行，默认auto读取和校验续算：
 
 ```bash
-CONFIG=examples/04_node_ccf/config/cc_config.jsonc \
-bash examples/04_node_ccf/run_node_ccf.sh /path/to/stations.csv
+bash examples/04_node_ccf/run_node_ccf_all.sh
 ```
 
-当前第380线默认只计算不同台站的无序对：34 个台站对应 `34 × 33 / 2 = 561` 个互相关。B–A 不重复计算，而由 A–B 沿延迟轴反转得到；输出矩阵对角线默认置零。如需自相关，设置 `INCLUDE_AUTOCORR=1`，此时增加 34 个对角线结果。计算先将 `minute_stack_s=60` 秒内的短窗叠加为一个一分钟段，再将 `save_every=30` 个一分钟段叠加，输出一个与 DAS CCF 兼容的 MAT 文件：`data` 形状为 `(源节点, 延迟采样点, 接收节点)`。末尾不足一个时间段的短窗也会单独保存。
+默认输出为 `outputs/node_ccf_spectral_v1`，总叠加和图位于同名 `_restack`
+目录。新输出目录避免混入旧周期相关/展平PWS文件。中断后原命令重跑，逐个
+检查SHA256并跳过完成组；损坏组重算，未完成分钟不落盘。输入文件属性、
+SAC头、顺序、时间段或科学参数变更必须换输出目录。读取方式和GPU批次可调。
 
-计算结束后，可用下面的命令执行与 DAS 相同的二次叠加流程，并生成基于节点真实 `profileX` 坐标的图片：
+`READ_MODE=auto|preload|block`：预加载峰值估计不超过当前可用内存50%时auto
+选择preload，否则每30分钟分块。两种模式使用相同全局窗口，跨分钟、组边界
+保留重叠，末尾只计算完整短窗。SAC采样率来自头，不使用配置中的旧sps。
+用户UTC边界就近对齐采样点，实际边界记入MAT；台站间采样网格仍严格检查。
 
-```bash
-./run_node_ccf_stack.sh
-```
+示例环境变量：`CC_BATCH_CHUNKS=8 CC_PAIR_BATCH=64 READ_MODE=block`。
+显式CPU参考：`CC_BACKEND=cpu CC_DEVICE=cpu`；Torch参考：
+`CC_BACKEND=torch CC_DEVICE=cuda`。`RESUME=0`要求空的新任务目录。
+所有命令行参数见 `bash run_node_ccf.sh --help`；shell脚本中每项有中文注释。
 
-它会读取 `outputs/node_ccf/cc_stack_*.mat`，在 `outputs/node_ccf_restack/` 中写入 `restack_*.mat`、`node_cc_preview.png` 和 `shots_fig/`。如果希望计算、二次叠加和绘图一次完成，运行：
+只做计算运行 `run_node_ccf.sh`；只做总叠加/绘图运行 `run_node_ccf_stack.sh`。
+生产目录不要同时运行两个写入任务。长任务建议tmux并重定向日志。
 
-```bash
-./run_node_ccf_all.sh
-```
+## 输出
 
-后处理默认使用 DAS 的 `stack_cc_chunks`，配置为 `pws + torch + cuda`；绘图脚本会使用 MAT 中的 `profileX`，不会把不规则节点距离强行当成等间距 `dx`。
+`cc_stack_0001_n30.mat` 的 `data` 为 `(source, lag, receiver)` float32，含
+`dt`、`profileX`、`station_id`、显式 `lags_s` 和从0开始的上三角pair索引。
+`valid_mask`、`valid_short_window_count`、`valid_minute_count` 为节点×节点。
+无效配对填零并标记无效，对角线也为无效。计数为uint64。
 
-输出文件按 `cc_stack_0001_n30.mat`、`cc_stack_0002_n30.mat` 等命名；文件名中的 `n` 是该文件包含的一分钟段数量，最后不足 30 段时也会单独保存。每个 MAT 文件包含 `data`、`dt`、`dx`、`profileX`、台站号和台站对索引等字段，可直接交给现有 DAS 的 MAT 后处理读取。`actual_short_window_count` 记录该文件实际叠加了多少个短窗，便于检查边界时间段。
+`dx`和`dshot`写相邻坐标差的中位数，仅兼容旧读取器，不参与计算。
+SAC缺失节点保留位置；内部间隙、非有限值、全零窗及质量失败逐窗标记。
+重叠段、组件歧义和采样率不一致报错。共同时间段按有文件台站的外部覆盖
+范围交集确定，内部缺口由掩码处理。尾组可无有效窗，仍保存时间轴和掩码。
+
+总叠加包含 `valid_file_count`、累计有效短窗/分钟数量、文件名和SHA256。
+二次叠加拒绝计算版本、台站顺序、频带/叠加参数或时间轴不一致的文件。
+
+## 验证
+
+本地：激活主项目 `.venv` 后执行 `uv run --no-sync pytest -q tests/node_ccf`，
+无CUDA时显式跳过硬件测试；RTX4090上以 `REQUIRE_NODE_CUDA=1` 禁止跳过。
+`run_node_ccf_gpu_checks.sh` 同时运行节点测试和既有CUDA后端回归。
+
+性能对照：`bash examples/04_node_ccf/run_node_ccf_benchmark.sh`，默认34节点、
+250Hz、120秒合成数据，预热后3次重新计算，记录包含传输的中位数和实际后端。

@@ -18,10 +18,10 @@ Options:
   --stack-size VALUE      二次叠加文件数；默认：None（全部文件）
   --interval VALUE        滑动窗口步长；默认：None（只输出一组）
   --start-index N         起始 MAT 索引；默认：0
-  --stack-method NAME     pws | robust | linear | mean；默认：pws
-  --cc-backend NAME       auto | cpu | torch；默认：torch
-  --cc-device NAME        auto | cpu | mps | cuda；默认：cuda
-  --cc-dtype NAME         float32 | float64；默认：float32
+  --stack-method NAME     pws | linear；默认：pws
+  --cc-backend NAME       cpp_cuda | cpu | torch；默认：cpp_cuda
+  --cc-device NAME        cpu | cuda；默认：cuda
+  --cc-dtype NAME         float32；默认：float32
   --plot-name NAME        汇总图名；默认：node_cc_preview.png
   --cmap NAME             reference/turbo/RdYlBu_r/Spectral_r/coolwarm/mycmap
   --no-save-shot-figures  不保存逐源节点图片，只保存汇总图
@@ -29,15 +29,15 @@ Options:
 EOF
 }
 
-INPUT_DIR="${SCRIPT_DIR}/outputs/node_ccf"
-OUTPUT_DIR="${SCRIPT_DIR}/outputs/node_ccf_restack"
+INPUT_DIR="${SCRIPT_DIR}/outputs/node_ccf_spectral_v1"
+OUTPUT_DIR="${SCRIPT_DIR}/outputs/node_ccf_spectral_v1_restack"
 GLOB_PATTERN="cc_stack_*.mat"
 STACK_SIZE="None"
 INTERVAL="None"
 START_INDEX="0"
-STACK_METHOD="pws"
-CC_BACKEND="torch"
-CC_DEVICE="cuda"
+STACK_METHOD="${STACKING_METHOD:-pws}"
+CC_BACKEND="${CC_BACKEND:-cpp_cuda}"
+CC_DEVICE="${CC_DEVICE:-cuda}"
 CC_DTYPE="float32"
 PLOT_NAME="node_cc_preview.png"
 CMAP="RdYlBu_r"

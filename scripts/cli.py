@@ -1,150 +1,179 @@
 #!/usr/bin/env python3
-"""Command line entrypoint for ordered-node SAC cross correlation.
+"""节点 SAC 全配对互相关 CLI（C++/CUDA 默认，不含 offset 模式）。
 
-Purpose
--------
-Read a station-order CSV, map each station to its SAC file(s), and reuse the
-DAS CCF implementation.  By default the common time range is preloaded into
-RAM. Short-window correlations are batched into 60-second blocks, followed by a
-second stack every ``save_every`` blocks, and written as MAT files.
-
-Usage
------
-The recommended entrypoint is ``bash examples/04_node_ccf/run_node_ccf.sh``.
-For direct use, pass ``--config`` plus optional ``--csv``, ``--data-dir`` and
-``--output-dir`` overrides.  Correlation and grouping overrides are available
-through the corresponding ``--read-mode``, ``--cc-backend``, ``--cc-device``,
-``--cc-batch-chunks``, ``--cc-len``, ``--step-s``, ``--minute-stack-s``,
-``--save-every`` and time-range options; ``--help`` prints the full list.
-
-Output
-------
-The output directory contains ``cc_stack_XXXX_nN.mat`` files.  Each file has a
-DAS-compatible ``data`` array with shape ``(source, lag, receiver)`` and
-metadata including ``profileX``, station IDs, pair indices, and the actual
-number of one-minute and short-window stacks.
-
-Example::
-
-    uv run python examples/04_node_ccf/scripts/cli.py --csv stations.csv \
-      --data-dir /Volumes/CSIM/2026SaErTuoHai_passive --output-dir outputs/node
+用途：按 CSV 台站顺序读取 SAC，补零FFT后白化并直接频域互相关，逐对PWS，
+短窗→分钟→30分钟MAT。默认校验任务清单并续算。
+运行：bash examples/04_node_ccf/run_node_ccf.sh [CSV] [SAC目录] [输出目录]
+直接运行：在项目 .venv 激活后，uv run --no-sync python
+examples/04_node_ccf/scripts/cli.py --config examples/04_node_ccf/config/cc_config.jsonc
+--start-utc 2026-07-09T11:00:00Z --end-utc 2026-07-09T12:00:00Z
+输出：cc_stack_XXXX_nN.mat、task_manifest.json，终端输出库存/进度/后端日志。
+--preflight 仅检查输入、参数和时间范围，不读取全部波形或创建输出。
+参数说明见各 add_argument(help=...)；--help 显示完整说明。
 """
 
 from __future__ import annotations
 
 import argparse
+import json
+import logging
 from pathlib import Path
+
+LOG = logging.getLogger(__name__)
+
+from node_compute.parameters import DEFAULTS
+from node_pipeline import NodeCCFConfig, choose_read_mode, prepare, run_node_ccf
 
 from dasqt.features.dispersion.backend.components.ccf.folder_pipeline import (
     load_config_json,
 )
-from node_pipeline import NodeCCFConfig, run_node_ccf
 
 
-def _config_relative_path(value: object, config_path: Path) -> Path:
-    """Resolve a node path relative to the standalone 04_node_ccf repository."""
-    path = Path(str(value)).expanduser()
-    if path.is_absolute():
-        return path
-    node_repo_dir = config_path.expanduser().resolve().parent.parent
-    return (node_repo_dir / path).resolve()
-
-
-def main() -> None:
+def parse_config(argv=None):
     parser = argparse.ArgumentParser(
-        description="按 CSV 顺序读取 SAC 节点并计算 DAS 兼容互相关"
+        description="节点全配对频域白化互相关，逐对PWS与原生CUDA"
     )
-    parser.add_argument("--config", type=Path, help="复用 DAS 的 cc_config.jsonc")
+    root = Path(__file__).resolve().parents[1]
     parser.add_argument(
-        "--csv", type=Path, help="排序 CSV；也可在配置中设置 station_csv"
+        "--config",
+        type=Path,
+        default=root / "config/cc_config.jsonc",
+        help="独立节点JSONC配置，不继承DAS几何参数",
     )
-    parser.add_argument(
-        "--data-dir", type=Path, help="SAC 节点目录；也可在配置中设置 node_data_dir"
-    )
-    parser.add_argument(
-        "--output-dir", type=Path, help="输出目录；也可在配置中设置 node_output_dir"
-    )
+    for key, help_text in [
+        ("csv", "台站排序CSV"),
+        ("data-dir", "SAC目录"),
+        ("output-dir", "MAT和任务清单输出目录"),
+    ]:
+        parser.add_argument("--" + key, type=Path, help=help_text)
     parser.add_argument(
         "--read-mode",
-        choices=("preload", "window"),
-        help="数据读取模式：preload 一次性读入内存，window 逐窗读取",
+        choices=("auto", "preload", "block"),
+        help="auto按可用内存50%%选择读取策略",
     )
-    parser.add_argument(
-        "--include-autocorr",
-        action="store_true",
-        help="额外计算台站自相关；默认只计算不同台站的无序对",
-    )
-    parser.add_argument("--pair-mode", choices=("all_pairs", "sliding"))
-    parser.add_argument("--offset-m", type=float, help="滑动模式接收范围（米）")
-    parser.add_argument("--dshot-m", type=float, help="滑动模式震源步长（米）")
-    parser.add_argument("--cc-len", type=float, help="互相关短窗长度（秒）")
-    parser.add_argument("--step-s", type=float, help="短窗步长（秒）")
     parser.add_argument(
         "--cc-backend",
-        choices=("auto", "cpu", "torch", "cupy", "cpp"),
-        help="CC 后端；GPU 可选 torch 或 cupy",
+        choices=("cpp_cuda", "cpu", "torch"),
+        help="cpp_cuda默认；cpu/torch是显式参考实现",
     )
     parser.add_argument(
-        "--cc-device",
-        choices=("auto", "cpu", "cuda", "mps"),
-        help="计算设备，例如 cuda",
+        "--cc-device", choices=("cpu", "cuda"), help="cpp_cuda必须cuda；cpu必须cpu"
     )
-    parser.add_argument("--cc-batch-chunks", type=int, help="一次送入后端的短窗数量")
+    for name, key, type_, help_text in [
+        ("cc-len", "cc_len", float, "短窗秒数"),
+        ("step-s", "cc_step_s", float, "短窗步长秒数"),
+        ("minute-stack-s", "minute_stack_s", float, "第一层时间块秒数"),
+        ("save-every", "save_every", int, "每多少第一层时间块保存"),
+        ("maxlag", "maxlag", float, "最大延迟秒数"),
+        ("freqmin", "freqmin", float, "带通下界Hz"),
+        ("freqmax", "freqmax", float, "带通上界Hz"),
+        ("time-downsample", "time_downsample", int, "GPU抗混叠降采样整数因子"),
+        ("cc-batch-chunks", "cc_batch_chunks", int, "最大窗口批次数"),
+        ("cc-pair-batch", "cc_pair_batch", int, "最大配对批次；0自动"),
+        (
+            "cc-memory-budget-bytes",
+            "cc_memory_budget_bytes",
+            int,
+            "临时GPU工作区预算字节；0自动，常驻统计量另计",
+        ),
+        ("cc-cuda-device", "cc_cuda_device", int, "CUDA设备编号"),
+    ]:
+        parser.add_argument("--" + name, dest=key, type=type_, help=help_text)
     parser.add_argument(
-        "--minute-stack-s", type=float, help="先将多少秒短窗叠加为一个分钟段"
+        "--stacking-method",
+        choices=("linear", "pws"),
+        help="每层叠加方式；PWS指数2，独立节点对",
     )
-    parser.add_argument("--maxlag", type=float, help="最大延迟（秒）")
-    parser.add_argument("--save-every", type=int, help="每多少分钟保存一个 MAT 文件")
-    parser.add_argument("--start-utc", help="UTC 起始时间，例如 2026-07-09T11:00:00Z")
-    parser.add_argument("--end-utc", help="UTC 结束时间，例如 2026-07-10T11:00:00Z")
-    args = parser.parse_args()
-    base_config = Path("examples/03_ccf/config/cc_config.jsonc")
-    config_path = args.config or Path("examples/04_node_ccf/config/cc_config.jsonc")
-    params = load_config_json(base_config) if base_config.exists() else {}
-    if config_path.exists():
-        params.update(load_config_json(config_path))
-    if args.cc_backend:
-        params["cc_backend"] = args.cc_backend
-    if args.cc_device:
-        params["cc_device"] = args.cc_device
-    if args.cc_batch_chunks is not None:
-        params["cc_batch_chunks"] = args.cc_batch_chunks
-    csv_path = args.csv or _config_relative_path(
-        params.get("station_csv", "stations.csv"), config_path
+    parser.add_argument("--start-utc", help="带时区起点，例如2026-07-09T11:00:00Z")
+    parser.add_argument("--end-utc", help="带时区终点，半开区间")
+    parser.add_argument(
+        "--resume",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="校验并跳过完整输出；默认启用",
     )
-    data_dir = args.data_dir or _config_relative_path(
-        params.get("node_data_dir", "/Volumes/CSIM/2026SaErTuoHai_passive"),
-        config_path,
+    parser.add_argument(
+        "--preflight", action="store_true", help="只检查SAC头和时间范围，输出JSON摘要"
     )
-    output_dir = args.output_dir or _config_relative_path(
-        params.get("node_output_dir", "outputs/node_ccf"), config_path
+    parser.add_argument(
+        "--print-output-dir", action="store_true", help=argparse.SUPPRESS
     )
-    run_node_ccf(
-        NodeCCFConfig(
-            csv_path=csv_path,
-            data_dir=data_dir,
-            output_dir=output_dir,
-            read_mode=args.read_mode or params.get("read_mode", "preload"),
-            include_autocorr=bool(
-                args.include_autocorr or params.get("include_autocorr", False)
-            ),
-            pair_mode=args.pair_mode or params.get("pair_mode", "all_pairs"),
-            cc_len=args.cc_len or float(params.get("cc_len", 5.0)),
-            step_s=args.step_s
-            or float(params.get("cc_step_s", params.get("cc_len", 5.0))),
-            minute_stack_s=args.minute_stack_s
-            or float(params.get("minute_stack_s", 60.0)),
-            maxlag=args.maxlag or float(params.get("maxlag", 0.4)),
-            offset_m=args.offset_m or float(params.get("offset", 50.0)),
-            dshot_m=args.dshot_m or float(params.get("dshot", 2.5)),
-            dtype=str(params.get("cc_dtype", "float32")),
-            start_utc=args.start_utc,
-            end_utc=args.end_utc,
-            cc_params=params,
-            save_every=args.save_every
-            or int(params.get("save_every", params.get("next_data", 30))),
+    args = parser.parse_args(argv)
+    values = load_config_json(args.config)
+    paths = {}
+    for key, arg, default in [
+        ("station_csv", "csv", "config/line_380_stations.csv"),
+        ("node_data_dir", "data_dir", "/mnt/nas-changbai/2026SaErTuoHai_passive"),
+        ("node_output_dir", "output_dir", "outputs/node_ccf"),
+    ]:
+        path = getattr(args, arg)
+        if path is None:
+            path = Path(values.get(key, default)).expanduser()
+            if not path.is_absolute():
+                path = root / path
+        paths[arg] = path.expanduser().resolve()
+    removed = {
+        "offset",
+        "dshot",
+        "xshot",
+        "receiver_side",
+        "min_branch_traces",
+        "cc_threads",
+        "cc_memory_budget_mb",
+    }
+    for key in removed.intersection(values):
+        LOG.warning("Ignoring removed node parameter %s", key)
+    params = dict(DEFAULTS)
+    params.update(
+        {
+            key: value
+            for key, value in values.items()
+            if key in DEFAULTS or key in {"pair_mode", "include_autocorr", "fk_enabled"}
+        }
+    )
+    for key in DEFAULTS:
+        value = getattr(args, key, None)
+        if value is not None:
+            params[key] = value
+    return NodeCCFConfig(
+        paths["csv"],
+        paths["data_dir"],
+        paths["output_dir"],
+        params,
+        args.start_utc,
+        args.end_utc,
+    ), "output" if args.print_output_dir else args.preflight
+
+
+def main():
+    logging.basicConfig(
+        level=logging.INFO, format="[%(asctime)s] %(levelname)s %(message)s"
+    )
+    config, preflight = parse_config()
+    if preflight == "output":
+        print(config.output_dir)
+    elif preflight:
+        catalog, params, start, end, total = prepare(config)
+        print(
+            json.dumps(
+                {
+                    "stations": len(catalog.stations),
+                    "pairs": len(catalog.stations) * (len(catalog.stations) - 1) // 2,
+                    "raw_fs": catalog.sampling_rate,
+                    "samples": total,
+                    "start_unix": start,
+                    "end_unix": end,
+                    "duration_hours": (end - start) / 3600,
+                    "selected_read_mode": choose_read_mode(
+                        params, total, len(catalog.stations)
+                    ),
+                    "output_dir": str(config.output_dir),
+                },
+                indent=2,
+            )
         )
-    )
+    else:
+        run_node_ccf(config)
 
 
 if __name__ == "__main__":

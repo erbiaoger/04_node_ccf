@@ -1,3 +1,10 @@
-# 节点 CCF 配置
+# 节点配置
 
-`cc_config.jsonc` 是节点工作流的完整配置，包含输入路径、台站对模式、读取模式、频带、短窗、归一化、后端、降采样、滑动几何和 TSI 兼容参数。默认 `read_mode=preload`，会将共同时间段一次性加载到内存，再按 `cc_batch_chunks` 将短窗组成 batch 交给配置的 CPU/GPU 后端；内存不足时可改为 `read_mode=window`。`station_csv`、`node_data_dir` 和 `node_output_dir` 使用绝对路径时按原样读取，使用 `./...` 等相对路径时以 `04_node_ccf` 仓库根目录为基准。运行时仍会先读取 `examples/03_ccf/config/cc_config.jsonc`，再用本文件覆盖同名字段，因此两套 DAS CCF 参数保持兼容；命令行 `--config` 可以继续覆盖本文件。
+`cc_config.jsonc` 是独立节点参数，默认CPP CUDA、逐窗RMA、补零频谱白化互相关、
+逐对PWS。`line_380_stations.csv` 给出台站顺序与真实distance_m；现有34节点561对。
+路径相对04_node_ccf根目录，命令行显式路径覆盖配置。不继承03_ccf配置。
+没有offset/sliding/dshot模式。采样率从SAC头获得，频带越界时报错。
+
+用法：`CONFIG=/path/to/cc_config.jsonc bash run_node_ccf.sh`。
+主机读取自动按可用内存50%估算选择preload或block；CUDA工作区按空闲显存
+自动规划，cc_memory_budget_bytes>0只约束临时工作区，常驻统计量另计。

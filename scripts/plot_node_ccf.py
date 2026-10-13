@@ -42,6 +42,8 @@ from dasqt.utils.imshow import (
 )
 
 configure_publication_style()
+# Restrict the family to the required font; avoid the old Times alias fallback.
+matplotlib.rcParams["font.family"] = ["Times New Roman"]
 
 LOG = logging.getLogger(__name__)
 
@@ -73,11 +75,16 @@ def _load_node_mat(
     mat = loadmat(path)
     if "data" not in mat:
         raise ValueError(f"{path.name} missing data")
-    data = np.asarray(mat["data"], dtype=np.float32).squeeze()
+    data = np.asarray(mat["data"], dtype=np.float32)
     if data.ndim == 2:
         data = data[None, :, :]
     if data.ndim != 3:
         raise ValueError(f"{path.name} data must be 2D/3D, got {data.shape}")
+    if "valid_mask" in mat:
+        mask = np.asarray(mat["valid_mask"], dtype=bool)
+        if mask.shape != (data.shape[0], data.shape[-1]):
+            raise ValueError(f"{path.name}: invalid pair mask shape")
+        data = np.where(mask[:, None, :], data, np.nan)
     dt = _scalar(mat, "dt", 1.0)
     dx = _scalar(mat, "dx", 1.0)
     profile = np.asarray(mat.get("profileX", []), dtype=float).squeeze()
@@ -86,6 +93,17 @@ def _load_node_mat(
     if profile.ndim != 1 or profile.size != data.shape[-1]:
         profile = np.arange(data.shape[-1], dtype=float) * dx
     return data, dt, profile
+
+
+def _valid_mean(data):
+    valid = np.isfinite(data)
+    count = valid.sum(axis=0)
+    return np.divide(
+        np.nansum(data, axis=0),
+        count,
+        out=np.full(data.shape[1:], np.nan),
+        where=count > 0,
+    )
 
 
 def _plot_matrix(
@@ -100,7 +118,11 @@ def _plot_matrix(
     matrix = np.asarray(matrix, dtype=float)
     nt, _ = matrix.shape
     t = (np.arange(nt, dtype=float) - nt // 2) * float(dt)
-    vmax = float(np.percentile(np.abs(matrix), 99)) if matrix.size else 1.0
+    vmax = (
+        float(np.percentile(np.abs(matrix[np.isfinite(matrix)]), 99))
+        if np.isfinite(matrix).any()
+        else 1.0
+    )
     if not np.isfinite(vmax) or vmax == 0:
         vmax = 1.0
     fig, ax = plt.subplots(figsize=figure_size("double", aspect=0.45))
@@ -165,7 +187,7 @@ def plot_node_results(
                     cmap=cmap,
                 )
             _plot_matrix(
-                np.mean(data, axis=0),
+                _valid_mean(data),
                 dt,
                 profile_x,
                 shots_dir / f"{path.stem}_merged_by_position.png",
@@ -187,7 +209,11 @@ def plot_node_results(
         matrix = data[0]
         nt = matrix.shape[0]
         t = (np.arange(nt, dtype=float) - nt // 2) * float(dt)
-        vmax = float(np.percentile(np.abs(matrix), 99)) if matrix.size else 1.0
+        vmax = (
+            float(np.percentile(np.abs(matrix[np.isfinite(matrix)]), 99))
+            if np.isfinite(matrix).any()
+            else 1.0
+        )
         vmax = vmax if np.isfinite(vmax) and vmax > 0 else 1.0
         image = ax.pcolormesh(
             _centers_to_edges(profile_x),

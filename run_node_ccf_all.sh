@@ -3,8 +3,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-COMPUTE_OUTPUT_DIR="${3:-${SCRIPT_DIR}/outputs/node_ccf}"
-RESTACK_OUTPUT_DIR="${COMPUTE_OUTPUT_DIR%/}_restack"
+COMPUTE_OUTPUT_DIR=""
+RESTACK_OUTPUT_DIR=""
 
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   cat <<EOF
@@ -17,8 +17,12 @@ EOF
   exit 0
 fi
 
+COMPUTE_OUTPUT_DIR="$(PRINT_OUTPUT_DIR=1 "${SCRIPT_DIR}/run_node_ccf.sh" "$@")"
+RESTACK_OUTPUT_DIR="${COMPUTE_OUTPUT_DIR%/}_restack"
+
 # 先执行第一层节点互相关；可通过位置参数覆盖 CSV、数据目录和输出目录。
 "${SCRIPT_DIR}/run_node_ccf.sh" "$@"
+[[ "${PREFLIGHT:-0}" == "1" ]] && exit 0
 
 # 计算脚本默认输出到 outputs/node_ccf，后处理脚本默认从该目录读取。
 # 如需修改后处理选项，直接单独运行 run_node_ccf_stack.sh。
