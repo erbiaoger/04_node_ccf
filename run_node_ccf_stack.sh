@@ -12,8 +12,8 @@ Usage:
   $(basename "$0") [options]
 
 Options:
-  --input-dir PATH        第一层 cc_stack_*.mat 目录；默认：${SCRIPT_DIR}/outputs/node_ccf
-  --output-dir PATH       restack MAT 和图片输出目录；默认：${SCRIPT_DIR}/outputs/node_ccf_restack
+  --input-dir PATH        第一层 cc_stack_*.mat 目录；默认：${SCRIPT_DIR}/outputs/node_ccf_spectral_v1
+  --output-dir PATH       restack MAT 和图片输出目录；默认：${SCRIPT_DIR}/outputs/node_ccf_spectral_v1_restack
   --glob PATTERN          MAT 文件模式；默认：cc_stack_*.mat
   --stack-size VALUE      二次叠加文件数；默认：None（全部文件）
   --interval VALUE        滑动窗口步长；默认：None（只输出一组）

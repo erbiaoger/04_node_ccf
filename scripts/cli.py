@@ -19,14 +19,14 @@ import json
 import logging
 from pathlib import Path
 
-LOG = logging.getLogger(__name__)
-
 from node_compute.parameters import DEFAULTS
 from node_pipeline import NodeCCFConfig, choose_read_mode, prepare, run_node_ccf
 
 from dasqt.features.dispersion.backend.components.ccf.folder_pipeline import (
     load_config_json,
 )
+
+LOG = logging.getLogger(__name__)
 
 
 def parse_config(argv=None):

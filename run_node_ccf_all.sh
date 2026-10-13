@@ -24,7 +24,7 @@ RESTACK_OUTPUT_DIR="${COMPUTE_OUTPUT_DIR%/}_restack"
 "${SCRIPT_DIR}/run_node_ccf.sh" "$@"
 [[ "${PREFLIGHT:-0}" == "1" ]] && exit 0
 
-# 计算脚本默认输出到 outputs/node_ccf，后处理脚本默认从该目录读取。
+# 后处理使用计算CLI解析后的真实输出路径，兼容自定义CONFIG。
 # 如需修改后处理选项，直接单独运行 run_node_ccf_stack.sh。
 "${SCRIPT_DIR}/run_node_ccf_stack.sh" \
   --input-dir "${COMPUTE_OUTPUT_DIR}" \
