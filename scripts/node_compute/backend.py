@@ -17,7 +17,7 @@ class NativeSession:
         module = require_native()
         if getattr(module, "node_pairwise_version", None) != VERSION:
             raise RuntimeError(
-                "Rebuild native/cc_cuda_engine: extension lacks node linear pair PWS v1"
+                "Rebuild native/cc_cuda_engine: extension lacks node spectral pair PWS v1"
             )
         self.native = module.NodePairSession(params, stations)
 

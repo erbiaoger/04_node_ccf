@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+from functools import lru_cache
 from pathlib import Path
 
 import matplotlib
@@ -158,6 +159,21 @@ def _load_fallback_profile(source_dir: Path | None) -> np.ndarray | None:
     return profile if profile.ndim == 1 else None
 
 
+@lru_cache(maxsize=8)
+def _source_ids(path):
+    mat = loadmat(path, variable_names=["station_id"])
+    return tuple(
+        str(np.asarray(item).reshape(-1)[0])
+        for item in np.asarray(mat.get("station_id", [])).reshape(-1)
+    )
+
+
+def _source_title(path, index):
+    ids = _source_ids(path)
+    label = ids[index] if index < len(ids) else str(index)
+    return f"Node CCF | source {label}"
+
+
 def plot_node_results(
     input_dir: Path,
     plot_name: str,
@@ -183,7 +199,7 @@ def plot_node_results(
                     dt,
                     profile_x,
                     shots_dir / f"{path.stem}_shot_{source_index:04d}.png",
-                    title=f"{path.stem} | source {source_index}",
+                    title=_source_title(path, source_index),
                     cmap=cmap,
                 )
             _plot_matrix(
@@ -191,7 +207,7 @@ def plot_node_results(
                 dt,
                 profile_x,
                 shots_dir / f"{path.stem}_merged_by_position.png",
-                title=f"{path.stem} | mean over source positions",
+                title="Node CCF | mean over source positions",
                 cmap=cmap,
             )
             LOG.info("saved source figures: %s", shots_dir)
@@ -224,7 +240,7 @@ def plot_node_results(
             vmin=-vmax,
             vmax=vmax,
         )
-        ax.set_title(f"{path.stem} | source 0")
+        ax.set_title(_source_title(path, 0))
         ax.set_xlabel("Distance (m)")
         ax.set_ylabel("Time lag (s)")
         style_axis(ax)
