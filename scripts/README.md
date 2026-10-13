@@ -12,3 +12,6 @@
 通过--help查看。配套一键shell在上一级，激活项目.venv并使用uv。
 
 测试位于主项目tests/node_ccf，方法与科学定义见上一级METHODS.md。
+
+`audit_node_ccf.py`流式检查完成后的全部时间组、SHA256、精确计数、有效掩码、
+延迟互易性和总叠加文件来源；配套上一级`run_node_ccf_audit.sh`，生成JSON报告。

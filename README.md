@@ -120,3 +120,7 @@ SAC缺失节点保留位置；内部间隙、非有限值、全零窗及质量�
 
 性能对照：`bash examples/04_node_ccf/run_node_ccf_benchmark.sh`，默认34节点、
 250Hz、120秒合成数据，预热后3次重新计算，记录包含传输的中位数和实际后端。
+
+完成后的逐文件审计：`bash examples/04_node_ccf/run_node_ccf_audit.sh`，校验全部
+任务组SHA256、精确计数、有效掩码、延迟互易性及总叠加文件来源，流式处理，
+生成质量报告JSON。自定义目录可传三个位置参数：输入目录、总叠加目录、JSON。
