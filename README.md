@@ -466,7 +466,7 @@ Park文件保存逐频率归一化的`energy`、未作显示归一化的`coheren
 
 ### SeisLib节点双站频散GUI
 
-DAS主界面菜单栏新增“节点双站频散”。在本目录也可运行：
+DAS主界面`Dispersion`菜单中新增“节点双站频散 / Two-station”。在本目录也可运行：
 
 ```bash
 ./two_station.sh

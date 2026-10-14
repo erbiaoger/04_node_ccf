@@ -95,6 +95,13 @@ def test_main_window_registers_and_opens_node_feature(tmp_path, monkeypatch):
         assert "node_two_station_dispersion" in {
             r.feature_id for r in main.submain_registry.registered_features()
         }
+        menu = next(
+            action.menu()
+            for action in main.menuBar().actions()
+            if action.text() == "Dispersion"
+        )
+        assert main.node_two_station_action in menu.actions()
+        assert "Two-station" in main.node_two_station_action.text()
         main.node_two_station_action.trigger()
         app.processEvents()
         children = main.submain_registry.instances("node_two_station_dispersion")
