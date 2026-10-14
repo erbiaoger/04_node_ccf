@@ -1,0 +1,621 @@
+diff --git a/native/cc_cuda_engine/include/engine.hpp b/native/cc_cuda_engine/include/engine.hpp
+index eed24f83..f0c0b53a 100644
+--- a/native/cc_cuda_engine/include/engine.hpp
++++ b/native/cc_cuda_engine/include/engine.hpp
+@@ -43,6 +43,7 @@ struct Config {
+   std::string freq_norm = "rma";
+   std::string method = "xcorr";
+   std::string stack = "linear";
++  std::string node_minute_stack;
+ };
+ 
+ struct TSIConfig {
+diff --git a/native/cc_cuda_engine/include/node_pairs.hpp b/native/cc_cuda_engine/include/node_pairs.hpp
+index ec203832..644e94b0 100644
+--- a/native/cc_cuda_engine/include/node_pairs.hpp
++++ b/native/cc_cuda_engine/include/node_pairs.hpp
+@@ -11,7 +11,7 @@ struct PairResult {
+ class NodePairSession {
+ public:
+   NodePairSession(const Config &, std::size_t stations, int device,
+-                  std::size_t pair_batch = 0);
++                  std::size_t pair_batch = 0, bool upload_block = true, bool reuse_workspace = true);
+   ~NodePairSession();
+   NodePairSession(const NodePairSession &) = delete;
+   NodePairSession &operator=(const NodePairSession &) = delete;
+@@ -26,6 +26,10 @@ public:
+   void clear_group();
+   void cancel() noexcept;
+   Diagnostics diagnostics() const;
++  std::size_t workspace_cached_bytes() const;
++  std::size_t window_batch_max() const;
++  std::size_t compute_batches() const;
++  std::size_t minute_span_max() const;
+   std::size_t station_count() const;
+   std::size_t pair_count() const;
+   std::size_t lag_count() const;
+diff --git a/native/cc_cuda_engine/src/node_pairs.cu b/native/cc_cuda_engine/src/node_pairs.cu
+index 4fd4f856..3b83b3a9 100644
+--- a/native/cc_cuda_engine/src/node_pairs.cu
++++ b/native/cc_cuda_engine/src/node_pairs.cu
+@@ -3,6 +3,15 @@
+ namespace dasqt::cuda_cc {
+ using namespace node_detail;
+ namespace {
++// Plan construction may report CUFFT_INTERNAL_ERROR under memory pressure.
++// Retry only construction, never an FFT execution after accumulators change.
++bool retryable_memory_error(const std::runtime_error &e) {
++  const std::string message=e.what();
++  return message.find("out of memory")!=std::string::npos ||
++      (message.find("plan:")!=std::string::npos &&
++       (message.find("cuFFT error 2")!=std::string::npos ||
++        message.find("cuFFT error 5")!=std::string::npos));
++}
+ __global__ void gather(const float *raw,const unsigned char *mask,const std::size_t *starts,
+                        float *windows,unsigned char *valid,std::size_t nt,
+                        std::size_t points,std::size_t stations,int factor,const float *taps) {
+@@ -71,18 +80,44 @@ struct Batch {
+   DeviceBuffer<unsigned char> mask,valid,quality,pair_valid;
+   DeviceBuffer<std::size_t> starts;
+   DeviceBuffer<cufftComplex> spectra,cross;
+-  PairWorkspace phase;
+-  cufftHandle backward;
++  PairWorkspace phase,finalizer;
++  PreprocessWorkspace preprocessing;
++  DeviceBuffer<unsigned char> final_mask;
++  DeviceBuffer<double> moments;
++  DeviceBuffer<unsigned long long> counts;
++  DeviceBuffer<MinuteSlice> minute_slices;
++  std::size_t window_capacity,pair_capacity,raw_capacity,minute_capacity=0;
+   Batch(std::size_t nt,std::size_t w,std::size_t nc,std::size_t n,
+-        std::size_t fft,std::size_t pairs,std::size_t lags)
+-    :raw(nt*nc),windows(w*n*nc),inverse(w*pairs*fft),
+-     mask(nt*nc),valid(w*nc),quality(w*nc),pair_valid(w*pairs),starts(w),
+-     spectra(w*nc*(fft/2+1)),cross(w*pairs*(fft/2+1)),phase(w*pairs,lags) {
+-    backward=cached_correlation_inverse(fft,w*pairs);
++        std::size_t fft,std::size_t pairs,std::size_t lags,bool upload_local=true)
++    :raw(upload_local?nt*nc:0),windows(w*n*nc),inverse(w*pairs*fft),
++     mask(upload_local?nt*nc:0),valid(w*nc),quality(w*nc),pair_valid(w*pairs),starts(w),
++     spectra(w*nc*(fft/2+1)),cross(w*pairs*(fft/2+1)),phase(w*pairs,lags),
++     finalizer(pairs,lags),preprocessing(w,nc,n,fft),final_mask(pairs),
++     window_capacity(w),pair_capacity(pairs),raw_capacity(upload_local?nt:0) {
++    cached_correlation_inverse(fft,w*pairs);
+     // Pre-create preprocessing plans before any accumulator update.
+     cached_double_plans(torch_stack_fast_len(n),w*nc);
+     cached_double_plans(fft,w*nc);
+   }
++  void reserve_raw(std::size_t nt,std::size_t stations) {
++    if(nt<=raw_capacity) return;
++    raw=DeviceBuffer<float>();mask=DeviceBuffer<unsigned char>();
++    raw=DeviceBuffer<float>(nt*stations);mask=DeviceBuffer<unsigned char>(nt*stations);raw_capacity=nt;
++  }
++  void reserve_minutes(std::size_t n,std::size_t pairs,std::size_t lags) {
++    if(n<=minute_capacity) return;
++    moments=DeviceBuffer<double>();counts=DeviceBuffer<unsigned long long>();minute_slices=DeviceBuffer<MinuteSlice>();
++    moments=DeviceBuffer<double>(3*(n-1)*pairs*lags);
++    counts=DeviceBuffer<unsigned long long>((n-1)*pairs);
++    minute_slices=DeviceBuffer<MinuteSlice>(n);minute_capacity=n;
++  }
++  std::size_t bytes() const {
++    return raw.bytes()+windows.bytes()+inverse.bytes()+mask.bytes()+valid.bytes()+quality.bytes()+pair_valid.bytes()+
++        starts.bytes()+spectra.bytes()+cross.bytes()+phase.values.bytes()+phase.half.bytes()+phase.analytic.bytes()+
++        finalizer.values.bytes()+finalizer.half.bytes()+finalizer.analytic.bytes()+preprocessing.bytes()+
++        final_mask.bytes()+moments.bytes()+counts.bytes()+minute_slices.bytes();
++  }
++
+ };
+ } // namespace
+ 
+@@ -96,16 +131,18 @@ struct NodePairSession::Impl {
+   DeviceBuffer<float> result,taps;
+   Diagnostics diag;
+   std::atomic<bool> cancelled{false};
+-  bool has_minute=false,restack=false,raw_mode=false;
+-  std::size_t minute_id=0;
++  bool has_minute=false,restack=false,raw_mode=false,upload_block=true,reuse_workspace=true;
++  std::unique_ptr<Batch> workspace;
++  std::size_t minute_id=0,compute_batches=0,window_batch_max=0,minute_span_max=0;
+   std::vector<std::size_t> source,receiver;
+-  Impl(Config options,std::size_t nc,int selected,std::size_t limit)
++  Impl(Config options,std::size_t nc,int selected,std::size_t limit,bool full_upload,bool reuse)
+     :p(options),device(selected),stations(nc),
+      points(static_cast<std::size_t>(llround(p.cc_len*p.sample_rate/p.time_downsample))),
+      fft(torch_stack_fast_len(2*points-1)),
+      lags(2*static_cast<std::size_t>(llround(p.maxlag*p.sample_rate/p.time_downsample))+1),
+      pairs(nc*(nc-1)/2),pair_limit(limit?std::min(limit,pairs):std::min<std::size_t>(pairs,256)),
+      minute(pairs,lags),group(pairs,lags),short_count(pairs),a(pairs),b(pairs),result(pairs*lags) {
++    upload_block=full_upload;reuse_workspace=reuse;
+     p.sample_rate/=p.time_downsample;
+     cuda_check(cudaMemset(short_count.get(),0,short_count.bytes()),"node short reset");
+     for(std::size_t i=0;i<nc;++i) for(std::size_t j=i+1;j<nc;++j) {source.push_back(i);receiver.push_back(j);}
+@@ -129,54 +166,117 @@ struct NodePairSession::Impl {
+     while(true) {
+       try {work=std::make_unique<PairWorkspace>(capacity,lags);mask=DeviceBuffer<unsigned char>(capacity);break;}
+       catch(const std::runtime_error &e) {
+-        if(std::string(e.what()).find("out of memory")==std::string::npos || capacity==1) throw;
++        if(!retryable_memory_error(e) || capacity==1) throw;
+         capacity=std::max<std::size_t>(1,capacity/2);++diag.oom_retries;
+       }
+     }
+-    finalize(minute,result.get(),p.stack=="pws");
++    commit_minute(*work,mask.get());
++  }
++  void commit_values(const MinuteSlice &values,PairWorkspace &work,unsigned char *mask) {
++    const auto capacity=work.capacity;
++    finalize_values(values.sum,values.real,values.imag,values.count,pairs,lags,result.get(),(p.node_minute_stack.empty()?p.stack:p.node_minute_stack)=="pws");
+     for(std::size_t offset=0;offset<pairs;offset+=capacity) {
+       const auto n=std::min(capacity,pairs-offset);
+-      cuda_check(cudaMemset(work->values.get(),0,work->values.bytes()),"node phase padding");
+-      pack<<<(n*work->fft+threads-1)/threads,threads>>>(result.get(),minute.count.get(),nullptr,work->values.get(),mask.get(),n,offset,lags,work->fft);
+-      update(group,*work,mask.get(),1,n,offset,p.stack=="pws");
++      cuda_check(cudaMemset(work.values.get(),0,work.values.bytes()),"node phase padding");
++      pack<<<(n*work.fft+threads-1)/threads,threads>>>(result.get(),values.count,nullptr,work.values.get(),mask,n,offset,lags,work.fft);
++      update(group,work,mask,1,n,offset,p.stack=="pws");
+     }
+-    sum_counts(minute,short_count.get());minute.clear();has_minute=false;
++    sum_count_values(values.count,short_count.get(),pairs);
++  }
++  void commit_minute(PairWorkspace &work,unsigned char *mask) {
++    commit_values({0,0,minute.sum.get(),minute.real.get(),minute.imag.get(),minute.count.get()},work,mask);
++    minute.clear();has_minute=false;
+   }
+   void batch(const float *host,const unsigned char *host_mask,std::size_t nt,
+-             const std::vector<std::size_t> &starts,std::size_t first,std::size_t w,std::size_t capacity) {
++             const std::vector<std::size_t> &starts,const std::vector<std::size_t> &minutes,
++             std::size_t first,std::size_t w,std::size_t capacity,
++             const float *device_raw=nullptr,const unsigned char *device_mask=nullptr) {
+     check();
+     const auto halo=p.time_downsample>1?20*p.time_downsample:0;
+     const auto lo=starts[first]>static_cast<std::size_t>(halo)?starts[first]-halo:0;
+     const auto hi=std::min(nt,starts[first+w-1]+(points-1)*p.time_downsample+halo+1);
+-    Batch work(hi-lo,w,stations,points,fft,capacity,lags);
++    std::unique_ptr<Batch> temporary;
++    Batch *selected=nullptr;
++    if(reuse_workspace) {
++      if(workspace && (workspace->window_capacity<w || workspace->pair_capacity<capacity)) workspace.reset();
++      if(!workspace) workspace=std::make_unique<Batch>(hi-lo,w,stations,points,fft,capacity,lags,device_raw==nullptr);
++      selected=workspace.get();
++    } else {temporary=std::make_unique<Batch>(hi-lo,w,stations,points,fft,capacity,lags,device_raw==nullptr);selected=temporary.get();}
++    auto &work=*selected;
++    if(!device_raw) work.reserve_raw(hi-lo,stations);
++    const auto tail=pairs%capacity;
++    if(tail) {
++      cached_correlation_inverse(fft,w*tail);
++      cached_pws_plans(work.phase.fft,w*tail);
++    }
++    struct Slice {std::size_t begin,count,id;};
++    std::vector<Slice> slices;
++    for(std::size_t begin=0;begin<w;) {
++      std::size_t stop=begin+1;
++      while(stop<w && minutes[first+stop]==minutes[first+begin]) ++stop;
++      slices.push_back({begin,stop-begin,minutes[first+begin]});begin=stop;
++    }
++    // One slab for all new minutes avoids four separate CUDA allocations per minute.
++    const auto stride=pairs*lags,plane=(slices.size()-1)*stride;
++    work.reserve_minutes(slices.size(),pairs,lags);
++    auto &moments=work.moments;auto &counts=work.counts;
++    if(plane) {
++      cuda_check(cudaMemsetAsync(moments.get(),0,3*plane*sizeof(double),nullptr),"node minute moment slab reset");
++      cuda_check(cudaMemsetAsync(counts.get(),0,(slices.size()-1)*pairs*sizeof(unsigned long long),nullptr),"node minute count slab reset");
++    }
++    std::vector<MinuteSlice> host_slices;
++    host_slices.push_back({slices[0].begin,slices[0].count,minute.sum.get(),minute.real.get(),minute.imag.get(),minute.count.get()});
++    for(std::size_t i=1;i<slices.size();++i) host_slices.push_back({slices[i].begin,slices[i].count,
++        moments.get()+(i-1)*stride,moments.get()+plane+(i-1)*stride,
++        moments.get()+2*plane+(i-1)*stride,counts.get()+(i-1)*pairs});
++    auto &device_slices=work.minute_slices;
++    // Buffers and both FFT row shapes are reserved before accumulator updates.
+     std::vector<std::size_t> local(w);
+     for(std::size_t i=0;i<w;++i) local[i]=starts[first+i]-lo;
+     CudaEventSpan upload(nullptr);
+-    cuda_check(cudaMemcpy(work.raw.get(),host+lo*stations,work.raw.bytes(),cudaMemcpyHostToDevice),"node block H2D");
+-    cuda_check(cudaMemcpy(work.mask.get(),host_mask+lo*stations,work.mask.bytes(),cudaMemcpyHostToDevice),"node mask H2D");
+-    cuda_check(cudaMemcpy(work.starts.get(),local.data(),work.starts.bytes(),cudaMemcpyHostToDevice),"node starts H2D");
++    cuda_check(cudaMemcpy(device_slices.get(),host_slices.data(),host_slices.size()*sizeof(MinuteSlice),cudaMemcpyHostToDevice),"node minute ranges H2D");
++    if(!device_raw) {
++      const auto input_size=(hi-lo)*stations;
++      cuda_check(cudaMemcpy(work.raw.get(),host+lo*stations,input_size*sizeof(float),cudaMemcpyHostToDevice),"node batch H2D");
++      cuda_check(cudaMemcpy(work.mask.get(),host_mask+lo*stations,input_size*sizeof(unsigned char),cudaMemcpyHostToDevice),"node batch mask H2D");
++      ++diag.input_transfers;diag.input_transferred_bytes+=input_size*(sizeof(float)+sizeof(unsigned char));
++    }
++    cuda_check(cudaMemcpy(work.starts.get(),local.data(),w*sizeof(std::size_t),cudaMemcpyHostToDevice),"node starts H2D");
+     upload.finish();diag.stage_seconds["upload"]+=upload.seconds();
+-    diag.input_transfers++;diag.input_transferred_bytes+=work.raw.bytes()+work.mask.bytes();
++    const auto raw=device_raw?device_raw+lo*stations:work.raw.get();
++    const auto mask=device_mask?device_mask+lo*stations:work.mask.get();
+     gather<<<w*stations,threads,2*threads*sizeof(unsigned int)>>>(
+-        work.raw.get(),work.mask.get(),work.starts.get(),work.windows.get(),work.valid.get(),hi-lo,points,stations,p.time_downsample,taps.get());
+-    preprocess_windows(work.windows.get(),w,points,stations,p,work.spectra.get(),fft,work.quality.get(),diag);
++        raw,mask,work.starts.get(),work.windows.get(),work.valid.get(),hi-lo,points,stations,p.time_downsample,taps.get());
++    preprocess_windows(work.windows.get(),w,points,stations,p,work.spectra.get(),fft,work.quality.get(),diag,&work.preprocessing);
+     CudaEventSpan correlation(nullptr);
+     for(std::size_t offset=0;offset<pairs;offset+=capacity) {
+       check();const auto n=std::min(capacity,pairs-offset),nf=fft/2+1;
+-      cuda_check(cudaMemset(work.cross.get(),0,work.cross.bytes()),"node cross padding");
+-      cuda_check(cudaMemset(work.phase.values.get(),0,work.phase.values.bytes()),"node lag padding");
++
+       cross_pairs<<<(w*n*nf+threads-1)/threads,threads>>>(work.spectra.get(),work.cross.get(),work.valid.get(),work.quality.get(),work.pair_valid.get(),a.get(),b.get(),stations,fft,w,n,offset);
+-      cufft_check(cufftExecC2R(work.backward,work.cross.get(),work.inverse.get()),"node correlation inverse");
++      cufft_check(cufftExecC2R(cached_correlation_inverse(fft,w*n),work.cross.get(),work.inverse.get()),"node correlation inverse");
+       crop<<<(w*n*work.phase.fft+threads-1)/threads,threads>>>(work.inverse.get(),work.phase.values.get(),w*n,fft,(lags-1)/2,work.phase.fft);
+-      update(minute,work.phase,work.pair_valid.get(),w,n,offset,p.stack=="pws");
++      const bool minute_pws=(p.node_minute_stack.empty()?p.stack:p.node_minute_stack)=="pws";
++      prepare_phase(work.phase,minute_pws,w*n);
++      update_slices(device_slices.get(),slices.size(),work.phase,work.pair_valid.get(),n,offset,lags,minute_pws);
+       ++diag.completed_tiles;
+     }
+     correlation.finish();diag.stage_seconds["correlation_and_stack"]+=correlation.seconds();
++    if(slices.size()>1) {
++      for(std::size_t i=0;i+1<slices.size();++i) commit_values(host_slices[i],work.finalizer,work.final_mask.get());
++      const auto &last=host_slices.back();
++      cuda_check(cudaMemcpyAsync(minute.sum.get(),last.sum,minute.sum.bytes(),cudaMemcpyDeviceToDevice,nullptr),"node last minute sum");
++      cuda_check(cudaMemcpyAsync(minute.real.get(),last.real,minute.real.bytes(),cudaMemcpyDeviceToDevice,nullptr),"node last minute real phase");
++      cuda_check(cudaMemcpyAsync(minute.imag.get(),last.imag,minute.imag.bytes(),cudaMemcpyDeviceToDevice,nullptr),"node last minute imaginary phase");
++      cuda_check(cudaMemcpyAsync(minute.count.get(),last.count,minute.count.bytes(),cudaMemcpyDeviceToDevice,nullptr),"node last minute count");
++      minute_id=slices.back().id;has_minute=true;
++    }
++    ++compute_batches;window_batch_max=std::max(window_batch_max,w);
++    minute_span_max=std::max(minute_span_max,slices.size());
+     sample_device_memory(diag);diag.time_tile_last=w;diag.source_tile_last=capacity;
+   }
+ };
+ 
+-NodePairSession::NodePairSession(const Config &p,std::size_t nc,int device,std::size_t limit):impl_(nullptr) {
++NodePairSession::NodePairSession(const Config &p,std::size_t nc,int device,std::size_t limit,bool upload_block,bool reuse_workspace):impl_(nullptr) {
+   if(nc<2 || nc>100000 || p.time_downsample<1 || p.space_downsample!=1 ||
+      p.method!="xcorr" || (p.stack!="pws" && p.stack!="linear") || p.fk_enabled)
+     throw std::invalid_argument("node pairs require >=2 stations, xcorr, linear/PWS, no spatial decimation/FK");
+@@ -187,7 +287,7 @@ NodePairSession::NodePairSession(const Config &p,std::size_t nc,int device,std::
+   cuda_check(cudaSetDevice(device),"node select device");
+   cudaDeviceProp prop{};cuda_check(cudaGetDeviceProperties(&prop,device),"node device properties");
+   if(prop.major!=8 || prop.minor!=9) throw std::runtime_error("node CUDA v1 requires sm_89");
+-  impl_=new Impl(p,nc,device,limit);
++  impl_=new Impl(p,nc,device,limit,upload_block,reuse_workspace);
+ }
+ NodePairSession::~NodePairSession() {if(impl_) {cudaSetDevice(impl_->device);delete impl_;}}
+ void NodePairSession::add_block(const float *host,const unsigned char *mask,std::size_t nt,
+@@ -200,26 +300,71 @@ void NodePairSession::add_block(const float *host,const unsigned char *mask,std:
+        (i && (starts[i]<=starts[i-1] || minutes[i]<minutes[i-1])) ||
+        (s.has_minute && minutes[i]<s.minute_id)) throw std::invalid_argument("node starts/minutes outside block or unordered");
+   }
++  // Stage the complete host block once when the workspace budget permits.
++  // The old per-window-tile path remains available for tiny budgets/OOM.
++  DeviceBuffer<float> staged_raw;
++  DeviceBuffer<unsigned char> staged_mask;
++  std::size_t staged_bytes=0,free_before=0,total_before=0;
++  cuda_check(cudaMemGetInfo(&free_before,&total_before),"node staging budget");
++  const auto available_staging=static_cast<std::size_t>(free_before*s.p.memory_fraction);
++  const auto staging_budget=s.p.memory_budget_bytes?std::min(s.p.memory_budget_bytes,available_staging):available_staging;
++  const auto bytes=nt*s.stations*(sizeof(float)+sizeof(unsigned char));
++  // The remaining half stays available for the planner, which can shrink tiles.
++  if(s.upload_block && bytes<=staging_budget/2) {
++    try {
++      staged_raw=DeviceBuffer<float>(nt*s.stations);
++      staged_mask=DeviceBuffer<unsigned char>(nt*s.stations);
++    } catch(const std::runtime_error &e) {
++      if(!retryable_memory_error(e)) throw;
++      staged_raw=DeviceBuffer<float>();staged_mask=DeviceBuffer<unsigned char>();
++      ++s.diag.oom_retries;
++    }
++    if(staged_raw.get() && staged_mask.get()) {
++      CudaEventSpan upload(nullptr);
++      cuda_check(cudaMemcpy(staged_raw.get(),host,staged_raw.bytes(),cudaMemcpyHostToDevice),"node complete block H2D");
++      cuda_check(cudaMemcpy(staged_mask.get(),mask,staged_mask.bytes(),cudaMemcpyHostToDevice),"node complete block mask H2D");
++      upload.finish();s.diag.stage_seconds["upload"]+=upload.seconds();
++      staged_bytes=bytes;++s.diag.input_transfers;s.diag.input_transferred_bytes+=bytes;
++      sample_device_memory(s.diag);
++    }
++  }
+   s.raw_mode=true;
+   for(std::size_t first=0;first<starts.size();) {
+     if(s.has_minute && minutes[first]!=s.minute_id) s.flush();
+     s.minute_id=minutes[first];s.has_minute=true;
+     std::size_t count=std::min<std::size_t>(s.p.window_batch_limit,starts.size()-first);
+-    while(count>1 && minutes[first+count-1]!=s.minute_id) --count;
++
+     std::size_t free=0,total=0;cuda_check(cudaMemGetInfo(&free,&total),"node budget");
+-    const auto budget=s.p.memory_budget_bytes?s.p.memory_budget_bytes:static_cast<std::size_t>(free*s.p.memory_fraction);
++    const auto available_budget=static_cast<std::size_t>((free+(s.workspace?s.workspace->bytes():0))*s.p.memory_fraction);
++    const auto budget=s.p.memory_budget_bytes?std::min(s.p.memory_budget_bytes-staged_bytes,available_budget):available_budget;
+     std::size_t capacity=s.pair_limit;
+     // Conservative bound includes double preprocessing, inverse and analytic FFT work areas.
+-    const auto estimate=[&] {return count*(s.stations*s.fft*100+capacity*(s.fft*48+torch_stack_fast_len(s.lags)*48));};
++    const auto distinct_minutes=[&] {
++      std::size_t n=1;
++      for(std::size_t i=1;i<count;++i) if(minutes[first+i]!=minutes[first+i-1]) ++n;
++      return n;
++    };
++    const auto base_estimate=[&] {
++      return count*s.stations*s.fft*100+(distinct_minutes()-1)*s.pairs*(s.lags*3*sizeof(double)+sizeof(unsigned long long));
++    };
++    const auto estimate=[&] {
++      return base_estimate()+count*capacity*(s.fft*48+torch_stack_fast_len(s.lags)*48)+
++          (distinct_minutes()>1?capacity*(torch_stack_fast_len(s.lags)*32+sizeof(unsigned char)):0);
++    };
++    const auto shrink=[&] {
++      if(count>1 && (base_estimate()>budget/2 || capacity==1)) count=std::max<std::size_t>(1,count/2);
++      else if(capacity>1) capacity=std::max<std::size_t>(1,capacity/2);
++      else count=std::max<std::size_t>(1,count/2);
++    };
+     while(estimate()>budget && (capacity>1 || count>1)) {
+-      if(capacity>1) capacity=std::max<std::size_t>(1,capacity/2);else count=std::max<std::size_t>(1,count/2);
++      shrink();
+     }
+     if(estimate()>budget) throw std::runtime_error("Node CUDA budget cannot hold one window/pair workspace");
+     for(;;) {
+-      try {s.batch(host,mask,nt,starts,first,count,capacity);break;}
++      try {s.batch(host,mask,nt,starts,minutes,first,count,capacity,staged_raw.get(),staged_mask.get());break;}
+       catch(const std::runtime_error &e) {
+-        if(std::string(e.what()).find("out of memory")==std::string::npos || (capacity==1 && count==1)) throw;
+-        if(capacity>1) capacity=std::max<std::size_t>(1,capacity/2);else count=std::max<std::size_t>(1,count/2);
++        if(!retryable_memory_error(e) || (capacity==1 && count==1)) throw;
++        shrink();
+         ++s.diag.oom_retries;
+       }
+     }
+@@ -262,6 +407,10 @@ void NodePairSession::clear_group() {
+ }
+ void NodePairSession::cancel() noexcept {impl_->cancelled.store(true);}
+ Diagnostics NodePairSession::diagnostics() const {return impl_->diag;}
++std::size_t NodePairSession::workspace_cached_bytes() const {return impl_->workspace?impl_->workspace->bytes():0;}
++std::size_t NodePairSession::window_batch_max() const {return impl_->window_batch_max;}
++std::size_t NodePairSession::compute_batches() const {return impl_->compute_batches;}
++std::size_t NodePairSession::minute_span_max() const {return impl_->minute_span_max;}
+ std::size_t NodePairSession::station_count() const {return impl_->stations;}
+ std::size_t NodePairSession::pair_count() const {return impl_->pairs;}
+ std::size_t NodePairSession::lag_count() const {return impl_->lags;}
+diff --git a/native/cc_cuda_engine/src/node_pairs_binding.cpp b/native/cc_cuda_engine/src/node_pairs_binding.cpp
+index 6a7278e5..9f79ecf5 100644
+--- a/native/cc_cuda_engine/src/node_pairs_binding.cpp
++++ b/native/cc_cuda_engine/src/node_pairs_binding.cpp
+@@ -21,12 +21,14 @@ Config parameters(const py::dict &d) {
+   p.freqmin=option<float>(d,"freqmin",2.0f);p.freqmax=option<float>(d,"freqmax",30.0f);
+   p.time_norm=option<std::string>(d,"time_norm","rma");p.freq_norm=option<std::string>(d,"freq_norm","rma");
+   p.stack=option<std::string>(d,"stacking_method","pws");p.method=option<std::string>(d,"cc_method","xcorr");
++  p.node_minute_stack=option<std::string>(d,"file_stacking_method",p.stack);
++  if(p.node_minute_stack!="pws" && p.node_minute_stack!="linear") throw std::invalid_argument("invalid file_stacking_method");
+   p.smooth=option<int>(d,"smooth_N",5);p.smoothspect=option<int>(d,"smoothspect_N",5);
+   p.max_over_std=option<float>(d,"max_over_std",1.0e9f);
+   p.time_downsample=option<int>(d,"time_downsample",1);p.space_downsample=option<int>(d,"space_downsample",1);
+   p.fk_enabled=option<bool>(d,"fk_enabled",false);
+   p.memory_fraction=option<float>(d,"cc_memory_safety_fraction",0.70f);
+-  p.window_batch_limit=option<int>(d,"cc_batch_chunks",32);
++  p.window_batch_limit=option<int>(d,"cc_batch_chunks",12);
+   p.memory_budget_bytes=option<std::size_t>(d,"cc_memory_budget_bytes",0);
+   if(option<std::string>(d,"cc_dtype","float32")!="float32" || option<std::string>(d,"cc_device","cuda")!="cuda")
+     throw std::invalid_argument("node CUDA requires float32/cuda");
+@@ -51,11 +53,15 @@ py::dict result(PairResult r) {
+ }
+ }
+ void register_node_pairs(py::module_ &m) {
++  m.attr("node_block_upload")=true;
++  m.attr("node_cross_minute_batch")=true;
++  m.attr("node_workspace_reuse")=true;
++  m.attr("node_independent_minute_stack")=true;
+   m.attr("node_pairwise_version")="node_spectral_pair_pws_v1";
+   py::class_<NodePairSession>(m,"NodePairSession")
+     .def(py::init([](py::dict d,std::size_t stations) {
+       return std::make_unique<NodePairSession>(parameters(d),stations,
+-          option<int>(d,"cc_cuda_device",0),option<std::size_t>(d,"cc_pair_batch",0));
++          option<int>(d,"cc_cuda_device",0),option<std::size_t>(d,"cc_pair_batch",0),option<bool>(d,"cc_upload_block",true),option<bool>(d,"cc_reuse_workspace",true));
+     }),py::arg("config"),py::arg("stations"))
+     .def("add_block",[](NodePairSession &s,FloatArray data,MaskArray mask,
+                          const std::vector<std::size_t> &starts,const std::vector<std::size_t> &minutes) {
+@@ -81,6 +87,8 @@ void register_node_pairs(py::module_ &m) {
+       out["retained_bytes"]=d.retained_bytes;out["input_transfers"]=d.input_transfers;
+       out["input_transferred_bytes"]=d.input_transferred_bytes;out["window_batch_last"]=d.time_tile_last;
+       out["pair_batch_last"]=d.source_tile_last;out["oom_retries"]=d.oom_retries;
+-      out["completed_tiles"]=d.completed_tiles;return out;
++      out["completed_tiles"]=d.completed_tiles;
++      out["workspace_cached_bytes"]=s.workspace_cached_bytes();out["window_batch_max"]=s.window_batch_max();out["compute_batches"]=s.compute_batches();
++      out["minute_span_max"]=s.minute_span_max();return out;
+     });
+ }
+diff --git a/native/cc_cuda_engine/src/node_pairs_internal.hpp b/native/cc_cuda_engine/src/node_pairs_internal.hpp
+index 0b1435eb..a53afcce 100644
+--- a/native/cc_cuda_engine/src/node_pairs_internal.hpp
++++ b/native/cc_cuda_engine/src/node_pairs_internal.hpp
+@@ -18,13 +18,39 @@ struct PairWorkspace {
+   DeviceBuffer<cufftComplex> half, analytic;
+   PairWorkspace(std::size_t rows, std::size_t lags);
+ };
++struct MinuteSlice {
++  std::size_t first,windows;
++  double *sum,*real,*imag;
++  unsigned long long *count;
++};
++void update_slices(const MinuteSlice *, std::size_t slices, PairWorkspace &,
++                   const unsigned char *valid, std::size_t pairs,
++                   std::size_t offset, std::size_t lags, bool pws);
++void prepare_phase(PairWorkspace &, bool pws, std::size_t rows = 0);
++void update_prepared(PairStats &, PairWorkspace &, const unsigned char *,
++                     std::size_t windows, std::size_t pairs, std::size_t offset,
++                     bool pws, std::size_t window_offset = 0);
+ void update(PairStats &, PairWorkspace &, const unsigned char *,
+             std::size_t windows, std::size_t pairs, std::size_t offset,
+             bool pws);
++void finalize_values(const double *, const double *, const double *,
++                     const unsigned long long *, std::size_t pairs,
++                     std::size_t lags, float *, bool pws);
+ void finalize(const PairStats &, float *, bool pws);
++void sum_count_values(const unsigned long long *, unsigned long long *, std::size_t pairs);
+ void sum_counts(const PairStats &, unsigned long long *);
++struct PreprocessWorkspace {
++  DeviceBuffer<double> traces,normalized,padded;
++  DeviceBuffer<cufftDoubleComplex> spectrum,correlation,whitened;
++  PreprocessWorkspace(std::size_t windows,std::size_t stations,std::size_t points,std::size_t corr_fft)
++    :traces(windows*stations*torch_stack_fast_len(points)),normalized(traces.size()),
++     padded(windows*stations*corr_fft),
++     spectrum(windows*stations*(torch_stack_fast_len(points)/2+1)),
++     correlation(windows*stations*(corr_fft/2+1)),whitened(correlation.size()) {}
++  std::size_t bytes() const {return traces.bytes()+normalized.bytes()+padded.bytes()+spectrum.bytes()+correlation.bytes()+whitened.bytes();}
++};
+ void preprocess_windows(const float *, std::size_t windows, std::size_t points,
+                         std::size_t stations, const Config &,
+                         cufftComplex *spectra, std::size_t corr_fft,
+-                        unsigned char *valid, Diagnostics &);
++                        unsigned char *valid, Diagnostics &, PreprocessWorkspace *reuse = nullptr);
+ } // namespace dasqt::cuda_cc::node_detail
+diff --git a/native/cc_cuda_engine/src/node_pairs_preprocessing.cu b/native/cc_cuda_engine/src/node_pairs_preprocessing.cu
+index cb97c823..c429c6ae 100644
+--- a/native/cc_cuda_engine/src/node_pairs_preprocessing.cu
++++ b/native/cc_cuda_engine/src/node_pairs_preprocessing.cu
+@@ -10,32 +10,33 @@ __global__ void white_to_padded(const double *input,double *output,std::size_t r
+ }
+ void preprocess_windows(const float *input,std::size_t windows,std::size_t points,
+                         std::size_t stations,const Config &p,cufftComplex *output,
+-                        std::size_t corr_fft,unsigned char *valid,Diagnostics &diag) {
++                        std::size_t corr_fft,unsigned char *valid,Diagnostics &diag,PreprocessWorkspace *reuse) {
+   CudaEventSpan elapsed(nullptr);
+   const auto rows=windows*stations, pre_fft=torch_stack_fast_len(points), nf=pre_fft/2+1;
+-  DeviceBuffer<double> traces(rows*pre_fft),normalized(rows*pre_fft);
+-  DeviceBuffer<cufftDoubleComplex> spectrum(rows*nf);
++  std::unique_ptr<PreprocessWorkspace> temporary;
++  if(!reuse) {temporary=std::make_unique<PreprocessWorkspace>(windows,stations,points,corr_fft);reuse=temporary.get();}
++  auto &traces=reuse->traces;auto &normalized=reuse->normalized;auto &spectrum=reuse->spectrum;
++  auto &padded=reuse->padded;auto &correlation=reuse->correlation;auto &whitened=reuse->whitened;
+   prepare_file_double<<<rows,threads,2*threads*sizeof(double)>>>(
+       input,traces.get(),points,stations,0,pre_fft,true);
+   auto &plans=cached_double_plans(pre_fft,rows);
+   cufft_check(cufftExecD2Z(plans.forward,traces.get(),spectrum.get()),"node bandpass forward");
+-  file_filter_double<<<(spectrum.size()+threads-1)/threads,threads>>>(
+-      spectrum.get(),spectrum.size(),nf,pre_fft,p.sample_rate,p.freqmin,p.freqmax);
++  file_filter_double<<<(rows*nf+threads-1)/threads,threads>>>(
++      spectrum.get(),rows*nf,nf,pre_fft,p.sample_rate,p.freqmin,p.freqmax);
+   cufft_check(cufftExecZ2D(plans.inverse,spectrum.get(),traces.get()),"node bandpass inverse");
+   const int tm=p.time_norm=="one_bit"?1:p.time_norm=="rma"?2:0;
+   file_time_double<<<rows,threads,3*threads*sizeof(double)>>>(
+       traces.get(),normalized.get(),valid,points,pre_fft,tm,std::max(p.smooth,1),p.max_over_std);
+   const auto corr_nf=corr_fft/2+1;
+-  DeviceBuffer<double> padded(rows*corr_fft);
+-  DeviceBuffer<cufftDoubleComplex> correlation(rows*corr_nf), whitened(rows*corr_nf);
++
+   white_to_padded<<<(rows*corr_fft+threads-1)/threads,threads>>>(
+       normalized.get(),padded.get(),rows,points,pre_fft,corr_fft);
+   auto &corr_plans=cached_double_plans(corr_fft,rows);
+   cufft_check(cufftExecD2Z(corr_plans.forward,padded.get(),correlation.get()),"node padded FFT");
+   const int fm=p.freq_norm=="phase_only"?1:p.freq_norm=="rma"?2:0;
+   if(fm) {
+-    file_white_double<<<(correlation.size()+threads-1)/threads,threads>>>(
+-        correlation.get(),whitened.get(),correlation.size(),corr_nf,corr_fft,
++    file_white_double<<<(rows*corr_nf+threads-1)/threads,threads>>>(
++        correlation.get(),whitened.get(),rows*corr_nf,corr_nf,corr_fft,
+         p.sample_rate,p.freqmin,p.freqmax,fm,std::max(p.smoothspect,1));
+     std::swap(correlation,whitened);
+   }
+diff --git a/native/cc_cuda_engine/src/node_pairs_stacking.cu b/native/cc_cuda_engine/src/node_pairs_stacking.cu
+index 005079eb..dbffa4de 100644
+--- a/native/cc_cuda_engine/src/node_pairs_stacking.cu
++++ b/native/cc_cuda_engine/src/node_pairs_stacking.cu
+@@ -18,14 +18,14 @@ __global__ void accumulate(const float *values, const cufftComplex *analytic,
+                            double *real, double *imag, unsigned long long *count,
+                            std::size_t windows, std::size_t pairs,
+                            std::size_t offset, std::size_t lags,
+-                           std::size_t fft, bool pws) {
++                           std::size_t fft, bool pws, std::size_t window_offset) {
+   const auto index = blockIdx.x*blockDim.x + threadIdx.x;
+   if (index >= pairs*lags) return;
+   const auto pair = index/lags, lag = index%lags;
+   double s=0, re=0, im=0;
+   unsigned long long n=0;
+   for (std::size_t w=0; w<windows; ++w) {
+-    const auto row=w*pairs+pair;
++    const auto row=(window_offset+w)*pairs+pair;
+     if (!valid[row]) continue;
+     ++n; s += values[row*fft+lag];
+     if (pws) {
+@@ -38,20 +38,59 @@ __global__ void accumulate(const float *values, const cufftComplex *analytic,
+   sum[out]+=s; real[out]+=re; imag[out]+=im;
+   if (lag==0) count[offset+pair]+=n;
+ }
+-void update(PairStats &stats, PairWorkspace &work, const unsigned char *valid,
+-            std::size_t windows, std::size_t pairs, std::size_t offset, bool pws) {
++__global__ void accumulate_slices(const MinuteSlice *slices,std::size_t nslices,
++                                  const float *values,const cufftComplex *analytic,
++                                  const unsigned char *valid,std::size_t pairs,
++                                  std::size_t offset,std::size_t lags,std::size_t fft,bool pws) {
++  const auto index=blockIdx.x*blockDim.x+threadIdx.x;
++  if(index>=nslices*pairs*lags) return;
++  const auto slice=slices[index/(pairs*lags)];
++  const auto pair=(index/lags)%pairs,lag=index%lags;
++  double sum=0,re=0,im=0;unsigned long long n=0;
++  for(std::size_t w=0;w<slice.windows;++w) {
++    const auto row=(slice.first+w)*pairs+pair;
++    if(!valid[row]) continue;
++    ++n;sum+=values[row*fft+lag];
++    if(pws) {
++      const auto z=analytic[row*fft+lag];
++      const double a=hypot(static_cast<double>(z.x),static_cast<double>(z.y));
++      if(a>0) {re+=z.x/a;im+=z.y/a;}
++    }
++  }
++  const auto out=(offset+pair)*lags+lag;
++  slice.sum[out]+=sum;slice.real[out]+=re;slice.imag[out]+=im;
++  if(lag==0) slice.count[offset+pair]+=n;
++}
++void update_slices(const MinuteSlice *slices,std::size_t nslices,PairWorkspace &work,
++                   const unsigned char *valid,std::size_t pairs,std::size_t offset,
++                   std::size_t lags,bool pws) {
++  accumulate_slices<<<(nslices*pairs*lags+threads-1)/threads,threads>>>(
++      slices,nslices,work.values.get(),work.analytic.get(),valid,pairs,offset,lags,work.fft,pws);
++  cuda_check(cudaGetLastError(),"node accumulate independent minutes");
++}
++void prepare_phase(PairWorkspace &work, bool pws, std::size_t rows) {
++  rows=rows?rows:work.capacity;
+   if (pws) {
+-    auto &plans=cached_pws_plans(work.fft, work.capacity);
++    auto &plans=cached_pws_plans(work.fft, rows);
+     cufft_check(cufftExecR2C(plans.forward, work.values.get(), work.half.get()), "node PWS FFT");
+-    analytic_spectrum<<<(work.analytic.size()+threads-1)/threads,threads>>>(
+-        work.half.get(),work.analytic.get(),work.capacity,work.fft);
++    analytic_spectrum<<<(rows*work.fft+threads-1)/threads,threads>>>(
++        work.half.get(),work.analytic.get(),rows,work.fft);
+     cufft_check(cufftExecC2C(plans.inverse,work.analytic.get(),work.analytic.get(),CUFFT_INVERSE), "node PWS inverse");
+   }
++}
++void update_prepared(PairStats &stats, PairWorkspace &work, const unsigned char *valid,
++                     std::size_t windows, std::size_t pairs, std::size_t offset,
++                     bool pws, std::size_t window_offset) {
+   accumulate<<<(pairs*stats.lags+threads-1)/threads,threads>>>(
+       work.values.get(),work.analytic.get(),valid,stats.sum.get(),stats.real.get(),
+-      stats.imag.get(),stats.count.get(),windows,pairs,offset,stats.lags,work.fft,pws);
++      stats.imag.get(),stats.count.get(),windows,pairs,offset,stats.lags,work.fft,pws,window_offset);
+   cuda_check(cudaGetLastError(), "node accumulate");
+ }
++void update(PairStats &stats, PairWorkspace &work, const unsigned char *valid,
++            std::size_t windows, std::size_t pairs, std::size_t offset, bool pws) {
++  prepare_phase(work,pws);
++  update_prepared(stats,work,valid,windows,pairs,offset,pws);
++}
+ __global__ void finish_stats(const double *sum,const double *real,const double *imag,
+                             const unsigned long long *count,float *out,
+                             std::size_t lags,bool pws) {
+@@ -83,16 +122,24 @@ __global__ void finish_stats(const double *sum,const double *real,const double *
+     out[i]=static_cast<float>((v-mean)/peak);
+   }
+ }
+-void finalize(const PairStats &stats,float *output,bool pws) {
+-  finish_stats<<<stats.pairs,threads,2*threads*sizeof(double)>>>(
+-      stats.sum.get(),stats.real.get(),stats.imag.get(),stats.count.get(),output,stats.lags,pws);
++void finalize_values(const double *sum,const double *real,const double *imag,
++                     const unsigned long long *count,std::size_t pairs,std::size_t lags,
++                     float *output,bool pws) {
++  finish_stats<<<pairs,threads,2*threads*sizeof(double)>>>(sum,real,imag,count,output,lags,pws);
+   cuda_check(cudaGetLastError(),"node finalize");
+ }
++void finalize(const PairStats &stats,float *output,bool pws) {
++  finalize_values(stats.sum.get(),stats.real.get(),stats.imag.get(),stats.count.get(),
++                  stats.pairs,stats.lags,output,pws);
++}
+ __global__ void count_add(const unsigned long long *input,unsigned long long *output,std::size_t n) {
+   const auto i=blockIdx.x*blockDim.x+threadIdx.x;
+   if(i<n) output[i]+=input[i];
+ }
++void sum_count_values(const unsigned long long *input,unsigned long long *output,std::size_t pairs) {
++  count_add<<<(pairs+threads-1)/threads,threads>>>(input,output,pairs);
++}
+ void sum_counts(const PairStats &stats,unsigned long long *output) {
+-  count_add<<<(stats.pairs+threads-1)/threads,threads>>>(stats.count.get(),output,stats.pairs);
++  sum_count_values(stats.count.get(),output,stats.pairs);
+ }
+ } // namespace dasqt::cuda_cc::node_detail

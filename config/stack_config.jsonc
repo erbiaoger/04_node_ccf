@@ -1,0 +1,23 @@
+{
+    // 递归读取各日期子目录，只选择cc_stack文件，不读二次叠加文件。
+    "input_dir": "./outputs/node_ccf_fixed",
+    "output_dir": "./outputs/stack",
+    "glob": "cc_stack_*.h5",
+    "local_timezone": "Asia/Shanghai",
+    // null：不限日期；字符串：指定日期范围，首尾均包含。
+    "start_date": null,
+    "end_date": null,
+    // 两项都为null：全天；例如"08:00"、"18:00"：只叠加完整落入此范围的文件。
+    // 已叠加H5无法再按样本裁剪，跨边界的文件排除并记入清单。
+    "start_time": null,
+    "end_time": null,
+    // null：所有匹配日期；3：匹配日期按时间排序，只选前3天。
+    "first_n_days": null,
+    // null：叠加全部选中文件；20：只叠加按时间排序后的前20个文件。
+    "stack_count": null,
+    "stack_method": "pws",
+    "cc_backend": "cpp_cuda",
+    "cc_device": "cuda",
+    // 每天GPS可能略有变化；相对第一个文件允许位移10米，输出使用首文件几何。
+    "geometry_tolerance_m": 10.0
+}

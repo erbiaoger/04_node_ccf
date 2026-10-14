@@ -2,12 +2,12 @@
 """节点 SAC 全配对互相关 CLI（C++/CUDA 默认，不含 offset 模式）。
 
 用途：按 CSV 台站顺序读取 SAC，补零FFT后白化并直接频域互相关，逐对PWS，
-短窗→分钟→30分钟MAT。默认校验任务清单并续算。
+短窗→分钟→30分钟H5。默认校验任务清单并续算。
 运行：bash examples/04_node_ccf/run_node_ccf.sh [CSV] [SAC目录] [输出目录]
 直接运行：在项目 .venv 激活后，uv run --no-sync python
 examples/04_node_ccf/scripts/cli.py --config examples/04_node_ccf/config/cc_config.jsonc
 --start-utc 2026-07-09T11:00:00Z --end-utc 2026-07-09T12:00:00Z
-输出：cc_stack_XXXX_nN.mat、task_manifest.json，终端输出库存/进度/后端日志。
+输出：cc_stack_XXXX_nN.h5、task_manifest.json，终端输出库存/进度/后端日志。
 --preflight 仅检查输入、参数和时间范围，不读取全部波形或创建输出。
 参数说明见各 add_argument(help=...)；--help 显示完整说明。
 """
@@ -19,12 +19,11 @@ import json
 import logging
 from pathlib import Path
 
-from node_compute.parameters import DEFAULTS
-from node_pipeline import NodeCCFConfig, choose_read_mode, prepare, run_node_ccf
-
 from dasqt.features.dispersion.backend.components.ccf.folder_pipeline import (
     load_config_json,
 )
+from node_compute.parameters import DEFAULTS, OPTIONAL_PARAMS
+from node_pipeline import NodeCCFConfig, choose_read_mode, prepare, run_node_ccf
 
 LOG = logging.getLogger(__name__)
 
@@ -43,13 +42,13 @@ def parse_config(argv=None):
     for key, help_text in [
         ("csv", "台站排序CSV"),
         ("data-dir", "SAC目录"),
-        ("output-dir", "MAT和任务清单输出目录"),
+        ("output-dir", "H5和任务清单输出目录"),
     ]:
         parser.add_argument("--" + key, type=Path, help=help_text)
     parser.add_argument(
         "--read-mode",
         choices=("auto", "preload", "block"),
-        help="auto按可用内存50%%选择读取策略",
+        help="auto仅对小于512MiB的数据预加载；大任务分块并预取",
     )
     parser.add_argument(
         "--cc-backend",
@@ -60,6 +59,20 @@ def parse_config(argv=None):
         "--cc-device", choices=("cpu", "cuda"), help="cpp_cuda必须cuda；cpu必须cpu"
     )
     for name, key, type_, help_text in [
+        ("io-workers", "io_workers", int, "并行SAC读取线程数，默认8"),
+        (
+            "prefetch-blocks",
+            "prefetch_blocks",
+            int,
+            "预取下一块并与CUDA计算重叠：1启用，0串行",
+        ),
+        ("async-save", "async_save", int, "H5写盘与下一组计算重叠：1启用，0同步"),
+        (
+            "read-hours",
+            "read_hours",
+            float,
+            "一次读入主机内存的小时数：24/48；0按输出片段读取",
+        ),
         ("cc-len", "cc_len", float, "短窗秒数"),
         ("step-s", "cc_step_s", float, "短窗步长秒数"),
         ("minute-stack-s", "minute_stack_s", float, "第一层时间块秒数"),
@@ -68,6 +81,18 @@ def parse_config(argv=None):
         ("freqmin", "freqmin", float, "带通下界Hz"),
         ("freqmax", "freqmax", float, "带通上界Hz"),
         ("time-downsample", "time_downsample", int, "GPU抗混叠降采样整数因子"),
+        (
+            "cc-upload-block",
+            "cc_upload_block",
+            int,
+            "30分钟整块上传显存：1启用，0逐小批传输",
+        ),
+        (
+            "cc-reuse-workspace",
+            "cc_reuse_workspace",
+            int,
+            "复用CUDA工作区：1启用，0关闭",
+        ),
         ("cc-batch-chunks", "cc_batch_chunks", int, "最大窗口批次数"),
         ("cc-pair-batch", "cc_pair_batch", int, "最大配对批次；0自动"),
         (
@@ -85,6 +110,11 @@ def parse_config(argv=None):
         help="每层叠加方式；PWS指数2，独立节点对",
     )
     parser.add_argument("--start-utc", help="带时区起点，例如2026-07-09T11:00:00Z")
+    parser.add_argument(
+        "--sac-sampling-rate-hz",
+        type=float,
+        help="显式标称SAC采样率，仅接受与float32头间隔一致的值",
+    )
     parser.add_argument("--end-utc", help="带时区终点，半开区间")
     parser.add_argument(
         "--resume",
@@ -128,20 +158,25 @@ def parse_config(argv=None):
         {
             key: value
             for key, value in values.items()
-            if key in DEFAULTS or key in {"pair_mode", "include_autocorr", "fk_enabled"}
+            if key in DEFAULTS
+            or key in OPTIONAL_PARAMS
+            or key
+            in {"pair_mode", "include_autocorr", "fk_enabled", "sac_sampling_rate_hz"}
         }
     )
     for key in DEFAULTS:
         value = getattr(args, key, None)
         if value is not None:
             params[key] = value
+    if args.sac_sampling_rate_hz is not None:
+        params["sac_sampling_rate_hz"] = args.sac_sampling_rate_hz
     return NodeCCFConfig(
         paths["csv"],
         paths["data_dir"],
         paths["output_dir"],
         params,
-        args.start_utc,
-        args.end_utc,
+        args.start_utc or values.get("start_utc"),
+        args.end_utc or values.get("end_utc"),
     ), "output" if args.print_output_dir else args.preflight
 
 
@@ -164,6 +199,7 @@ def main():
                     "start_unix": start,
                     "end_unix": end,
                     "duration_hours": (end - start) / 3600,
+                    "read_hours": params["read_hours"],
                     "selected_read_mode": choose_read_mode(
                         params, total, len(catalog.stations)
                     ),

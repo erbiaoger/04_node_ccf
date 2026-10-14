@@ -1,0 +1,7 @@
+{
+  "source_file": "/csim2/zhangzhiyu/MyProjects/dasQt_examples/04_node_ccf/outputs/node_ccf/20260707_day_0800_1800_raw/stations_gps.csv",
+  "gps_date_utc": "2026/07/07",
+  "stations": 60,
+  "sha256": "211f201bfa17c2d1b9a6143c23ea9bfdf4fce97ac664974ec8a18eb269eaaa96",
+  "policy": "Fixed station geometry reused unchanged on every processing date; assumes stations did not move."
+}

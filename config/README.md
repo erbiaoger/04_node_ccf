@@ -5,6 +5,9 @@
 路径相对04_node_ccf根目录，命令行显式路径覆盖配置。不继承03_ccf配置。
 没有offset/sliding/dshot模式。采样率从SAC头获得，频带越界时报错。
 
-用法：`CONFIG=/path/to/cc_config.jsonc bash run_node_ccf.sh`。
-主机读取自动按可用内存50%估算选择preload或block；CUDA工作区按空闲显存
+用法：`config=/path/to/cc_config.jsonc bash run_node_ccf.sh`。
+默认block，read_hours=24一次缓存24小时，io_workers=8并行读SAC，
+prefetch_blocks=1预取下一主机缓存，与当前缓存的30分钟GPU批次计算重叠；
+read_hours可改48，0恢复每输出片段读取。save_every独立控制输出片段长度。
+cc_upload_block=1整块上传显存，async_save=1后台写H5。CUDA工作区按空闲显存
 自动规划，cc_memory_budget_bytes>0只约束临时工作区，常驻统计量另计。

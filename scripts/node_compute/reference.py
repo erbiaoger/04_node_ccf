@@ -233,13 +233,18 @@ class ReferenceSession:
         self.raw_mode = self.restack = False
         self.clear_group()
 
-    def _new(self):
+    def _new(self, minute=False):
         return PairAccumulator(
-            len(self.source), 2 * self.radius + 1, self.ops, self.p["stacking_method"]
+            len(self.source),
+            2 * self.radius + 1,
+            self.ops,
+            self.p.get("file_stacking_method", self.p["stacking_method"])
+            if minute
+            else self.p["stacking_method"],
         )
 
     def clear_group(self):
-        self.minute, self.group = self._new(), self._new()
+        self.minute, self.group = self._new(minute=True), self._new()
         self.short_count = np.zeros(len(self.source), dtype=np.uint64)
         self.minute_id = None
         self.raw_mode = self.restack = False
@@ -248,7 +253,7 @@ class ReferenceSession:
         if self.minute_id is not None:
             self.group.add(self.minute.finish(), self.minute.count > 0)
             self.short_count += self.ops.host(self.minute.count).astype(np.uint64)
-            self.minute = self._new()
+            self.minute = self._new(minute=True)
             self.minute_id = None
 
     def add_block(self, data, valid, starts, minute_ids):

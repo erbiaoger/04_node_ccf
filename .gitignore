@@ -13,3 +13,6 @@ __pycache__/
 .idea/
 .env
 .venv/
+
+# 用户复制的SeisLib仓库暂不提交，保留为本地独立依赖
+/seislib/

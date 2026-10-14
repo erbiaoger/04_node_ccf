@@ -4,7 +4,7 @@
 Purpose
 -------
 The DAS ``stack_saved_cc_mat.py`` script performs the second-level stack and
-writes ``restack_*.mat`` files. This companion plotter uses the ``profileX``
+writes ``restack_*.h5`` files. This companion plotter uses the ``profileX``
 array stored by the node workflow instead of assuming a uniform ``dx``.
 
 Usage
@@ -33,14 +33,13 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
-from scipy.io import loadmat
-
 from dasqt.utils.imshow import (
     configure_publication_style,
     figure_size,
     get_colormap,
     style_axis,
 )
+from node_output.artifacts import load_result as loadmat
 
 configure_publication_style()
 # Restrict the family to the required font; avoid the old Times alias fallback.
@@ -74,6 +73,10 @@ def _load_node_mat(
     path: Path, fallback_profile: np.ndarray | None = None
 ) -> tuple[np.ndarray, float, np.ndarray]:
     mat = loadmat(path)
+    if str(np.asarray(mat.get("geometry_type", "")).item()) == "geographic":
+        raise ValueError(
+            "Geographic node layout requires pair_distance_m; this plotter expects a one-dimensional profileX"
+        )
     if "data" not in mat:
         raise ValueError(f"{path.name} missing data")
     data = np.asarray(mat["data"], dtype=np.float32)
@@ -151,7 +154,7 @@ def _plot_matrix(
 def _load_fallback_profile(source_dir: Path | None) -> np.ndarray | None:
     if source_dir is None:
         return None
-    files = sorted(path for path in source_dir.glob("cc_stack_*.mat") if path.is_file())
+    files = sorted(path for path in source_dir.glob("cc_stack_*.h5") if path.is_file())
     if not files:
         return None
     mat = loadmat(files[0])
@@ -181,7 +184,7 @@ def plot_node_results(
     source_dir: Path | None,
     cmap: str = "RdYlBu_r",
 ) -> None:
-    files = sorted(path for path in input_dir.glob("restack_*.mat") if path.is_file())
+    files = sorted(path for path in input_dir.glob("restack_*.h5") if path.is_file())
     if not files:
         raise FileNotFoundError(f"No restack MAT files found in {input_dir}")
     fallback_profile = _load_fallback_profile(source_dir)
@@ -264,7 +267,7 @@ def main() -> None:
     parser.add_argument(
         "--profile-source-dir",
         type=Path,
-        help="可选的第一层 cc_stack_*.mat 目录，用于恢复 profileX。",
+        help="可选的第一层 cc_stack_*.h5 目录，用于恢复 profileX。",
     )
     parser.add_argument(
         "--plot-name", default="node_cc_preview.png", help="汇总图文件名。"

@@ -3,7 +3,7 @@
 
 Purpose: verify all scheduled groups, manifest checksums, dimensions, finite
 values, reciprocal lag reversal, validity masks, exact count limits and final
-restack provenance. Streams one MAT at a time; no full history is loaded.
+restack provenance. Streams one H5 at a time; no full history is loaded.
 Run in the project .venv: uv run --no-sync python
 examples/04_node_ccf/scripts/audit_node_ccf.py --input-dir examples/04_node_ccf/outputs/node_ccf_spectral_v1
 --restack-dir examples/04_node_ccf/outputs/node_ccf_spectral_v1_restack
@@ -23,7 +23,7 @@ import numpy as np
 from node_compute.parameters import VERSION
 from node_compute.schedule import groups
 from node_output.artifacts import atomic_json, digest
-from scipy.io import loadmat
+from node_output.artifacts import load_result as loadmat
 
 LOG = logging.getLogger(__name__)
 
@@ -77,12 +77,16 @@ def audit(input_dir, restack_dir, verify_checksums=True):
     windows = 0
     valid_pair_min = len(source)
     for group in groups(total, params["samp_freq"], params):
-        path = input_dir / f"cc_stack_{group.index:04d}_n{group.minute_count}.mat"
         record = manifest["completed"].get(str(group.index))
+        path = input_dir / (
+            record["file"]
+            if record
+            else f"cc_stack_{group.index:04d}_n{group.minute_count}.h5"
+        )
         if not record or record["file"] != path.name or not path.is_file():
             raise ValueError(f"Missing completed group: {path}")
         if verify_checksums and digest(path) != record["sha256"]:
-            raise ValueError(f"MAT checksum differs: {path}")
+            raise ValueError(f"H5 checksum differs: {path}")
         mat = loadmat(path)
         check_cube(mat, stations, lags)
         if str(scalar(mat, "task_id")) != manifest["task_id"] or scalar(
@@ -108,10 +112,10 @@ def audit(input_dir, restack_dir, verify_checksums=True):
         if group.index % 50 == 0:
             LOG.info("Audited %d groups", group.index)
     if len(manifest["completed"]) != len(files) or len(
-        list(input_dir.glob("cc_stack_*.mat"))
+        list(input_dir.glob("cc_stack_*.h5"))
     ) != len(files):
         raise ValueError("Unexpected extra output groups")
-    restacks = sorted(restack_dir.glob("restack_*.mat"))
+    restacks = sorted(restack_dir.glob("restack_*.h5"))
     if len(restacks) != 1:
         raise ValueError("Expected exactly one full-period restack")
     final = loadmat(restacks[0])
@@ -163,13 +167,13 @@ def audit(input_dir, restack_dir, verify_checksums=True):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="流式审计节点全部MAT、有效计数、互易性及总叠加来源"
+        description="流式审计节点全部H5、有效计数、互易性及总叠加来源"
     )
     parser.add_argument(
-        "--input-dir", type=Path, required=True, help="完成计算的MAT与task_manifest目录"
+        "--input-dir", type=Path, required=True, help="完成计算的H5与task_manifest目录"
     )
     parser.add_argument(
-        "--restack-dir", type=Path, required=True, help="全时段总叠加MAT目录"
+        "--restack-dir", type=Path, required=True, help="全时段总叠加H5目录"
     )
     parser.add_argument("--output-json", type=Path, required=True, help="质量报告JSON")
     parser.add_argument(

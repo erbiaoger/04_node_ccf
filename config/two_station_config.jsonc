@@ -1,0 +1,21 @@
+{
+    // 最终叠加H5；输入频带必须覆盖下面的扫描范围。
+    "input_file": "/csim2/zhangzhiyu/MyProjects/dasQt_examples/04_node_ccf/outputs/stack/stack_final.h5",
+    // 输出根目录，自动按输入与谱参数建立独立任务子目录。
+    "output_dir": "/csim2/zhangzhiyu/MyProjects/dasQt_examples/04_node_ccf/outputs/two_station",
+    "data_key": "data", // data | data_raw（文件必须包含此字段）
+    "fmin": 1.0, "fmax": 10.0, "df": 0.1, // Hz，网格插值不提高物理分辨率
+    "vmin": 500.0, "vmax": 4000.0, "dv": 10.0, // m/s
+    "velocity_window": true, // true | false
+    "taper_fraction": 0.05, // 速度走时窗余弦软边比例，0≤值<1
+    "min_wavelengths": 2.0,
+    "lag_margin": 0.05,
+    "min_points": 5,
+    "min_span_hz": 1.0,
+    "workers": 4,
+    "sample_count": 20,
+    "overall_backend": "torch_cuda", // torch_cuda | cpu
+    "cuda_device": 0,
+    "frequency_batch": 8,
+    "max_gap_hz": 0.5
+}
