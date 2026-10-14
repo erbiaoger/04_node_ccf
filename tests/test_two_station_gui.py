@@ -110,3 +110,24 @@ def test_main_window_registers_and_opens_node_feature(tmp_path, monkeypatch):
     finally:
         main.close()
         app.processEvents()
+
+
+def test_overall_button_runs_cpu_and_populates_canvas(tmp_path):
+    app = QApplication.instance() or QApplication([])
+    task = make_task(tmp_path, df=0.5, dv=100.0)
+    window = NodeTwoStationWindow(bridge=BridgeLogBus(parent=app), options=task.p)
+    window.loaded(task)
+    button = next(
+        button for button in window.action_buttons if button.text() == "总体参考初稿"
+    )
+    button.click()
+    deadline = time.monotonic() + 20
+    while window.busy() and time.monotonic() < deadline:
+        app.processEvents()
+        time.sleep(0.01)
+    app.processEvents()
+    assert not window.busy()
+    assert "Computing overall park" in window.log.toPlainText()
+    assert "Computing overall fj" in window.log.toPlainText()
+    assert len(window.reference_axis.collections) > 0
+    window.close()

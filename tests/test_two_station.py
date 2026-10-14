@@ -199,3 +199,17 @@ def test_candidate_only_stage_never_confirms_reference(tmp_path):
     r = task.pair(2)
     assert r["status"] == "awaiting_reference" and "candidate_density" in r
     assert not len(r["curve"])
+
+
+def test_overall_cpu_is_portable_without_server_kernel_path(tmp_path):
+    task = make_task(
+        tmp_path, dispersion_module="/does/not/exist/dispersion.py", df=0.5, dv=100.0
+    )
+    assert "dispersion_module" not in task.p
+    messages = []
+    task.overall(messages.append)
+    assert messages[:2] == ["Computing overall park", "Computing overall fj"]
+    with h5py.File(task.file, "r") as h:
+        for name in ("park", "fj"):
+            assert np.isfinite(h[f"overall/{name}/energy"][...]).all()
+    assert not task.confirmed
