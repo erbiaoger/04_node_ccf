@@ -7,10 +7,11 @@ import time
 from types import SimpleNamespace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-from dasqt.app.bridge.log_bus import BridgeLogBus
-from dasqt.features.node_two_station.gui import NodeTwoStationWindow
 from PyQt6.QtWidgets import QApplication
 from test_two_station import make_task
+
+from dasqt.app.bridge.log_bus import BridgeLogBus
+from dasqt.features.node_two_station.gui import NodeTwoStationWindow
 
 
 def test_gui_pair_navigation_edit_undo_and_reference_gate(tmp_path):
