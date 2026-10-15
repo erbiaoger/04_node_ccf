@@ -131,3 +131,64 @@ def test_overall_button_runs_cpu_and_populates_canvas(tmp_path):
     assert "Computing overall fj" in window.log.toPlainText()
     assert len(window.reference_axis.collections) > 0
     window.close()
+
+
+def test_real_mouse_load_auto_computes_and_restores_controls_on_gui_thread(tmp_path):
+    from PyQt6.QtCore import Qt, QThread
+    from PyQt6.QtTest import QTest
+
+    app = QApplication.instance() or QApplication([])
+    task = make_task(tmp_path, df=0.5, dv=100.0)
+    window = NodeTwoStationWindow(bridge=BridgeLogBus(parent=app), options=task.p)
+    threads = []
+    original = window.loaded
+
+    def loaded(*args, **kwargs):
+        threads.append(QThread.currentThread() == app.thread())
+        return original(*args, **kwargs)
+
+    window.loaded = loaded
+    window.show()
+    app.processEvents()
+    QTest.mouseClick(window.primary_load_button, Qt.MouseButton.LeftButton)
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline:
+        app.processEvents()
+        QTest.qWait(10)
+        if "总体频散计算完成" in window.log.toPlainText() and not window.busy():
+            break
+    assert threads == [True]
+    assert "开始计算总体频散参考" in window.log.toPlainText()
+    assert "总体频散计算完成" in window.log.toPlainText()
+    assert not window.busy()
+    assert all(button.isEnabled() for button in window.action_buttons)
+    assert len(window.reference_axis.collections) > 0
+    window.close()
+
+
+def test_loading_only_mode_leaves_visible_compute_button_enabled(tmp_path):
+    from PyQt6.QtCore import Qt
+    from PyQt6.QtTest import QTest
+
+    app = QApplication.instance() or QApplication([])
+    task = make_task(tmp_path, df=0.5, dv=100.0)
+    window = NodeTwoStationWindow(bridge=BridgeLogBus(parent=app), options=task.p)
+    window.auto_overall.setChecked(False)
+    window.show()
+    app.processEvents()
+    QTest.mouseClick(window.primary_load_button, Qt.MouseButton.LeftButton)
+    deadline = time.monotonic() + 20
+    while window.busy() and time.monotonic() < deadline:
+        app.processEvents()
+        QTest.qWait(10)
+    assert window.task is not None
+    assert (
+        window.primary_overall_button.isEnabled()
+        and window.primary_overall_button.isVisible()
+    )
+    QTest.mouseClick(window.primary_overall_button, Qt.MouseButton.LeftButton)
+    while window.busy() and time.monotonic() < deadline:
+        app.processEvents()
+        QTest.qWait(10)
+    assert "总体频散计算完成" in window.log.toPlainText()
+    window.close()
