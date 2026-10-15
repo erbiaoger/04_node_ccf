@@ -85,7 +85,7 @@ def main():
             / np.sum(raw.astype(float) ** 2, axis=0)
         ).tolist(),
         "limitations": "Distance/velocity prior imposed by mute; improvement in imaging alone is not evidence of a real propagation mode.",
-        "figure_qa": "All six traces, full lags, same raw per-trace amplitude scale on both panels. PNG at 300 dpi for diagnosis; no uncertainty estimates applicable.",
+        "figure_qa": "All selected traces, full lags, same raw per-trace amplitude scale on both panels. PNG at 300 dpi for diagnosis; no uncertainty estimates applicable.",
     }
     payload.update(
         data=data,

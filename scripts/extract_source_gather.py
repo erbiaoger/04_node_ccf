@@ -97,7 +97,7 @@ def main():
     temporary.replace(stem.with_suffix(".h5"))
     savemat(stem.with_suffix(".mat"), payload)
 
-    # Contract: show all six observed traces at actual radial offsets, full +/-4 s.
+    # Show every selected trace at its actual radial offset, over the full lag axis.
     # Per-trace peak normalization affects this preview only; no uncertainty claim.
     plt.rcParams.update(
         {
@@ -122,6 +122,7 @@ def main():
         [f"{args.source}\n0"] + [f"{ids[i]}\n{distances[i]:.0f}" for i in receivers],
     )
     ax.set_xlabel("Station ID / source-receiver distance (m)")
+    ax.tick_params(axis="x", labelsize=8)
     ax.set_ylabel("Correlation lag (s)")
     ax.set_ylim(lags[-1], lags[0])
     ax.set_title(

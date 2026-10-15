@@ -99,7 +99,7 @@ def main():
             assert np.isfinite(result["energy"]).all()
     stem.with_suffix(".h5.tmp").replace(stem.with_suffix(".h5"))
 
-    # Diagnostic comparison: all six receivers, actual distances, identical grids.
+    # Diagnostic comparison: all selected receivers, actual distances, identical grids.
     # No mode identification, interpolation beyond FFT support, or uncertainty claim.
     plt.rcParams.update(
         {
@@ -154,7 +154,7 @@ def main():
         "frequency_hz": [args.fmin, args.fmax, args.df],
         "velocity_m_s": [args.vmin, args.vmax, args.dv],
         "fft_spacing_hz": {name: r["fft_spacing_hz"] for name, r in results.items()},
-        "notes": "Six irregularly spaced traces only; no distance bins. Grid interpolation does not improve FFT resolution. Sparse spatial sampling can cause aliasing. Peaks are not confirmed modes.",
+        "notes": "Selected irregularly spaced traces only; no distance bins. Grid interpolation does not improve FFT resolution. Sparse spatial sampling can cause aliasing. Peaks are not confirmed modes.",
         "figure_qa": "Diagnostic PNG at 300 dpi; editable PDF/SVG. Four panels share scales and per-frequency normalization. No uncertainty estimates applicable.",
     }
     stem.with_suffix(".json").write_text(json.dumps(report, indent=2) + "\n")
