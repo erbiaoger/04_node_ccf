@@ -123,6 +123,14 @@ def main():
     )
     ax.set_xlabel("Station ID / source-receiver distance (m)")
     ax.tick_params(axis="x", labelsize=8)
+    if offsets[0] > np.ptp(offsets):
+        padding = max(float(np.ptp(offsets)) * 0.06, amplitude * 2)
+        ax.set_xlim(offsets[0] - padding, offsets[-1] + padding)
+        ax.set_xticks(offsets, [f"{ids[i]}\n{distances[i]:.0f}" for i in receivers])
+    for label in ax.get_xticklabels():
+        label.set_rotation(60)
+        label.set_rotation_mode("anchor")
+        label.set_horizontalalignment("right")
     ax.set_ylabel("Correlation lag (s)")
     ax.set_ylim(lags[-1], lags[0])
     ax.set_title(
