@@ -1,6 +1,7 @@
 """Extract an irregular receiver gather without changing stacked CCF samples."""
 
 import argparse
+import csv
 import hashlib
 import json
 from pathlib import Path
@@ -25,9 +26,17 @@ def main():
     )
     parser.add_argument("--source", default="19")
     parser.add_argument(
+        "--wiggle-amplitude-m",
+        type=float,
+        default=20,
+        help="Display-only peak wiggle excursion in meters; positive",
+    )
+    parser.add_argument(
         "--output", type=Path, default=Path("outputs/stack/line_source19")
     )
     args = parser.parse_args()
+    if not np.isfinite(args.wiggle_amplitude_m) or args.wiggle_amplitude_m <= 0:
+        raise ValueError("Wiggle amplitude must be finite and positive")
     if (
         len(set(args.stations)) != len(args.stations)
         or args.source not in args.stations
@@ -44,6 +53,8 @@ def main():
             i: gps2dist_azimuth(lat[s], lon[s], lat[i], lon[i])[0] for i in receivers
         }
         receivers.sort(key=distances.get)
+        if len(receivers) < 2:
+            raise ValueError("Select at least two receivers for dispersion imaging")
         offsets = np.array([distances[i] for i in receivers])
         data = np.column_stack([f["data"][s, :, i] for i in receivers])
         lags = f["lags_s"][:]
@@ -108,8 +119,10 @@ def main():
             "svg.fonttype": "none",
         }
     )
-    fig, ax = plt.subplots(figsize=(7.2, 6), layout="constrained")
-    amplitude = min(np.diff(np.r_[0, offsets])) * 0.35
+    fig, ax = plt.subplots(
+        figsize=(18, 8) if len(receivers) > 20 else (9, 6), layout="constrained"
+    )
+    amplitude = args.wiggle_amplitude_m
     for col, distance in enumerate(offsets):
         trace = data[:, col] / max(float(np.max(np.abs(data[:, col]))), 1e-30)
         x = distance + trace * amplitude
@@ -131,6 +144,13 @@ def main():
         label.set_rotation(60)
         label.set_rotation_mode("anchor")
         label.set_horizontalalignment("right")
+    if len(receivers) > 20:
+        from matplotlib.ticker import MaxNLocator
+
+        ax.xaxis.set_major_locator(MaxNLocator(12))
+        ax.xaxis.set_major_formatter(matplotlib.ticker.ScalarFormatter())
+        ax.tick_params(axis="x", labelrotation=0)
+        ax.set_xlabel("True source-receiver distance (m); station IDs in receivers.csv")
     ax.set_ylabel("Correlation lag (s)")
     ax.set_ylim(lags[-1], lags[0])
     ax.set_title(
@@ -151,6 +171,12 @@ def main():
         "display": "all selected receivers; per-trace peak normalization; no resampling, binning or interpolation",
     }
     stem.with_suffix(".json").write_text(json.dumps(report, indent=2) + "\n")
+    with (args.output / "receivers.csv").open("w", newline="") as stream:
+        writer = csv.writer(stream)
+        writer.writerow(["trace_index", "receiver_station_id", "distance_m"])
+        writer.writerows(
+            (j + 1, ids[i], float(offsets[j])) for j, i in enumerate(receivers)
+        )
     print(json.dumps(report, indent=2))
 
 
