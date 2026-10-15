@@ -41,6 +41,9 @@ def main():
         lags = h["lags_s"][:]
         dt = float(h["dt"][()])
         source = h["source_station_id"].asstr()[()]
+        mute_metadata = (
+            h["mute_parameters_json"].asstr()[()] if "mute_parameters_json" in h else ""
+        )
         receivers = h["receiver_station_id"].asstr()[:].tolist()
         if not h["valid_mask"][:].all():
             raise ValueError("Gather includes invalid traces")
@@ -85,6 +88,7 @@ def main():
             preprocessing="Per-trace peak normalization; no binning or resampling",
             data_axes="phase_velocity,frequency",
             display="Energy normalized per frequency; no automatic picks",
+            input_mute_parameters_json=mute_metadata,
         )
         h.create_dataset("receiver_station_id", data=np.asarray(receivers, dtype="S"))
         for name, result in results.items():
@@ -136,6 +140,7 @@ def main():
     fig.colorbar(im, ax=axes, label="Normalized spectral energy", shrink=0.85)
     fig.suptitle(
         f"Virtual source {source} | {len(receivers)} receivers | {distances[0]:.0f}–{distances[-1]:.0f} m"
+        + ("\nEarly-lag cosine mute applied" if mute_metadata else "")
     )
     fig.savefig(stem.with_suffix(".png"), dpi=300)
     fig.savefig(stem.with_suffix(".pdf"))
@@ -145,6 +150,7 @@ def main():
         "source": source,
         "receivers": receivers,
         "input_sha256": digest,
+        "input_mute_parameters": json.loads(mute_metadata) if mute_metadata else None,
         "frequency_hz": [args.fmin, args.fmax, args.df],
         "velocity_m_s": [args.vmin, args.vmax, args.dv],
         "fft_spacing_hz": {name: r["fft_spacing_hz"] for name, r in results.items()},
